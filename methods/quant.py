@@ -136,7 +136,10 @@ class QuantModel:
         self.spec, self.wmode, self.abits, self.hidden = spec, wmode, abits, tuple(hidden)
         # `micro` = per-GPU micro-batch; with `world` GPUs it sets the global batch together with
         # `batch` (kept for compatibility -- the global batch per optimiser step is unchanged).
-        self.cfg = dict(epochs=epochs, lr=lr, batch=batch, patience=patience, micro=micro)
+        # `hidden`/`wmode`/`abits` are recorded too so config_effective is self-describing: the
+        # ladder point names only `hidden`, and everything else here is a default.
+        self.cfg = dict(hidden=self.hidden, wmode=wmode, abits=abits, epochs=epochs, lr=lr,
+                        batch=batch, patience=patience, micro=micro)
         self.layers: list[QLayer] = []
         self._gemm: dict = {}     # hw.qmlp_forward's float weight copies, keyed on self.layers
         self._logits: dict = {}   # {id(pix): (pix, layers, logits)}; the harness scores val_x twice

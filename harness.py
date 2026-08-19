@@ -702,7 +702,8 @@ def run_point(mod: ModuleType, point: dict, data: Dataset, *, device: str, seed:
     val_acc = float((np.asarray(model.predict(data.val_x)) == data.val_y).mean()) * 100
     sc_va = scores(data.val_x)
     out = {"name": point["name"], "method": mod.__name__.split(".")[-1], "dataset": spec.name,
-           "seed": seed, "config": cfg, **m, "val_acc": round(val_acc, 2),
+           "seed": seed, "config": cfg, "config_effective": _jsonable(getattr(model, "cfg", {})),
+           **m, "val_acc": round(val_acc, 2),
            "train_s": round(train_s, 1), "train_wall_s": round(train_wall_s, 1),
            "train_samples": train_samples, "device": device}
 
@@ -714,6 +715,25 @@ def run_point(mod: ModuleType, point: dict, data: Dataset, *, device: str, seed:
 
     Path(str(stem) + ".json").write_text(json.dumps(out, indent=2) + "\n")
     print(f"[write] {stem.name}.json", flush=True)
+    return out
+
+
+def _jsonable(cfg) -> dict:
+    """The model's EFFECTIVE config, safe to json.dumps.
+
+    `config` above is only the ladder point, which for some methods (quant) names just the layer
+    widths and leaves epochs/lr/batch/patience as constructor defaults -- so the published record
+    would not say what actually ran. `model.cfg` carries the defaults too. Anything exotic is
+    stringified rather than allowed to kill a finished measurement at the write step.
+    """
+    out = {}
+    for k, v in dict(cfg or {}).items():
+        if isinstance(v, (str, int, float, bool, type(None))):
+            out[k] = v
+        elif isinstance(v, (list, tuple)):
+            out[k] = [x if isinstance(x, (str, int, float, bool, type(None))) else str(x) for x in v]
+        else:
+            out[k] = str(v)
     return out
 
 

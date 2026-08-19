@@ -351,6 +351,10 @@ class Forest:
         self.spec = spec
         self.n_trees, self.max_leaves, self.wbits, self.bits = trees, leaves, wbits, bits
         self.min_leaf, self.lr, self.patience = min_leaf, lr, patience
+        # the EFFECTIVE settings, defaults included, so the published .json records what actually
+        # ran rather than only what the ladder point happened to name. Read by harness.run_point.
+        self.cfg = dict(trees=trees, leaves=leaves, wbits=wbits, bits=bits,
+                        min_leaf=min_leaf, lr=lr, patience=patience)
         self.thresholds = even_thresholds(bits)
         self.trees: list = []
         self.w: list[int] = []
