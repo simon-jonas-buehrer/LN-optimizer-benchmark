@@ -34,6 +34,7 @@ import shutil
 import subprocess
 import tempfile
 import time
+import traceback
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
@@ -717,8 +718,21 @@ def run_point(mod: ModuleType, point: dict, data: Dataset, *, device: str, seed:
 
 
 def run_method(name: str, data: Dataset, *, device: str, seed: int,
-               only: list[str] | None, force: bool, gpus: int = 1) -> None:
+               only: list[str] | None, force: bool, gpus: int = 1,
+               keep_going: bool = True) -> None:
+    """Run every point of one method's ladder, in order.
+
+    One point that dies (OOM in the trainer, yosys out of memory or over its timeout, a REJECTED
+    circuit!=model cross-check) must not take the rest of the ladder with it: an unattended batch
+    job would otherwise lose every larger AND smaller point behind the first failure. So with
+    `keep_going` the failure is printed in full, recorded next to the point as `<point>.s<seed>.
+    failed.txt`, and the ladder continues. NOTHING is written to the point's `.json` -- a failed
+    point simply has no result, so a rejected or unmeasurable model can never enter the plots.
+    A summary of what failed is printed at the end and re-raised as a non-zero exit, so the batch
+    job is still marked FAILED and the gap is impossible to miss.
+    """
     mod = load_method(name)
+    failed: list[tuple[str, BaseException]] = []
     for point in mod.points(data.spec):
         if only and point["name"] not in only:
             continue
@@ -726,7 +740,23 @@ def run_method(name: str, data: Dataset, *, device: str, seed: int,
         if Path(str(stem) + ".json").exists() and not force:
             print(f"=== {data.spec.name}/{name}/{point['name']}: done, skipping (--force)", flush=True)
             continue
-        run_point(mod, point, data, device=device, seed=seed, gpus=gpus)
+        if not keep_going:
+            run_point(mod, point, data, device=device, seed=seed, gpus=gpus)
+            continue
+        try:
+            run_point(mod, point, data, device=device, seed=seed, gpus=gpus)
+        except KeyboardInterrupt:
+            raise
+        except BaseException as e:                      # SystemExit (REJECTED) included on purpose
+            tb = traceback.format_exc()
+            print(f"\n!!! FAILED {data.spec.name}/{name}/{point['name']}: "
+                  f"{type(e).__name__}: {e}\n{tb}", flush=True)
+            Path(str(stem) + ".failed.txt").write_text(tb)
+            failed.append((point["name"], e))
+    if failed:
+        names = ", ".join(n for n, _ in failed)
+        raise SystemExit(f"{data.spec.name}/{name}: {len(failed)} point(s) failed: {names} "
+                         f"(see results/{data.spec.name}/{name}/*.failed.txt)")
 
 
 def rescore_method(name: str, data: Dataset, seed: int) -> None:

@@ -34,6 +34,8 @@ def main():
     r.add_argument("--gpus", type=int, default=1,
                    help="GPUs for DDP on the torch methods (backprop/dfa/quant); others use 1")
     r.add_argument("--force", action="store_true")
+    r.add_argument("--halt-on-error", action="store_true",
+                   help="stop at the first failing point instead of finishing the rest of the ladder")
 
     a = sub.add_parser("all", help="run the whole matrix (method x dataset x seed)")
     a.add_argument("--datasets", nargs="+", choices=D.NAMES, default=list(D.NAMES))
@@ -43,6 +45,8 @@ def main():
     a.add_argument("--gpus", type=int, default=1,
                    help="GPUs for DDP on the torch methods (backprop/dfa/quant); others use 1")
     a.add_argument("--force", action="store_true")
+    a.add_argument("--halt-on-error", action="store_true",
+                   help="stop at the first failing point instead of finishing the rest of the matrix")
 
     s = sub.add_parser("rescore", help="re-measure stored .sv without retraining")
     s.add_argument("method", choices=METHODS)
@@ -57,14 +61,26 @@ def main():
         return plots.main()
 
     if args.cmd == "all":
+        # One method x dataset cell that fails must not cost the rest of the matrix: collect the
+        # failures, keep going, and report them all at the end with a non-zero exit.
+        failures = []
         for ds in args.datasets:
             dat = D.load(ds)
             print(f"\n##### {ds}: train {dat.train_x.shape}, val {dat.val_x.shape}, "
                   f"test {dat.test_x.shape}", flush=True)
             for seed in args.seeds:
                 for method in args.methods:
-                    harness.run_method(method, dat, device=args.device, seed=seed,
-                                       only=None, force=args.force, gpus=args.gpus)
+                    try:
+                        harness.run_method(method, dat, device=args.device, seed=seed,
+                                           only=None, force=args.force, gpus=args.gpus,
+                                           keep_going=not args.halt_on_error)
+                    except SystemExit as e:
+                        if args.halt_on_error:
+                            raise
+                        print(f"!!! {e}", flush=True)
+                        failures.append(str(e))
+        if failures:
+            raise SystemExit("\n".join(["INCOMPLETE MATRIX:", *failures]))
         return
 
     dat = D.load(args.dataset)
@@ -73,7 +89,8 @@ def main():
     if args.cmd == "rescore":
         return harness.rescore_method(args.method, dat, args.seed)
     harness.run_method(args.method, dat, device=args.device, seed=args.seed,
-                       only=args.point, force=args.force, gpus=args.gpus)
+                       only=args.point, force=args.force, gpus=args.gpus,
+                       keep_going=not args.halt_on_error)
 
 
 if __name__ == "__main__":
