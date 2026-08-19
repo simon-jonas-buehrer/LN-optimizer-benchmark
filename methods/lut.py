@@ -98,7 +98,8 @@ class LutModel:
         return self._counts(pix) / g
 
     def save(self, path: str) -> None:
-        np.savez(path, thresholds=np.asarray(self.thresholds, np.int64),
-                 **{f"a{i}": a for i, (a, _, _) in enumerate(self.layers)},
-                 **{f"b{i}": b for i, (_, b, _) in enumerate(self.layers)},
-                 **{f"t{i}": t for i, (_, _, t) in enumerate(self.layers)})
+        with open(path, "wb") as f:  # file handle so numpy keeps the .ckpt name (no .npz suffix)
+            np.savez(f, thresholds=np.asarray(self.thresholds, np.int64),
+                     **{f"a{i}": a for i, (a, _, _) in enumerate(self.layers)},
+                     **{f"b{i}": b for i, (_, b, _) in enumerate(self.layers)},
+                     **{f"t{i}": t for i, (_, _, t) in enumerate(self.layers)})
