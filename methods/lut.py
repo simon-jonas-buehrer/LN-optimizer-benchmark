@@ -437,6 +437,13 @@ class LutModel:
     # 280k 7-11x, 1.75M 8-15x. 4096 sits inside the flat break-even region, so a wrong guess either
     # way costs ~nothing. Override per method, or with MNISTBENCH_LUTSIM_GPU_MIN_GATES.
     gpu_min_gates = int(os.environ.get("MNISTBENCH_LUTSIM_GPU_MIN_GATES", "4096"))
+    # Images per `lut_sim` chunk during evaluation. 512 is the `lut_sim` default and stays the
+    # default here, so a model that never sets it is unchanged. A method that knows its own size can
+    # raise it: sizing the chunk so the packed (n_sig, words) plane lands near ~32 MiB measured
+    # 1.35s -> 1.11s (1.21x) on harness-order CPU inference at the `l` tier (dfa's measurement).
+    # The word count `ceil(chunk/64)` should be a POWER OF TWO -- odd word counts gave most of that
+    # win back -- and the big tiers want to stay at 512 anyway to bound the signal plane.
+    sim_chunk = 512
 
     def __init__(self, spec: DatasetSpec):
         self.spec = spec
@@ -476,6 +483,7 @@ class LutModel:
         device when `sim_device` says so and the net is big enough -- `lut_sim`'s CUDA backend is
         bit-for-bit the numpy reference, so this cannot move a measured number, only the clock.
         Anything that goes wrong on the device falls back to numpy rather than failing the run.
+        `sim_chunk` likewise only changes how the images are batched, never the counts.
         """
         memo = self._counts_memo
         if memo is not None:
@@ -484,14 +492,15 @@ class LutModel:
                     and all(a is b for a, b in zip(lay, self.layers))):
                 return out
         dev = self._eval_device()
+        chunk = getattr(self, "sim_chunk", 512)
         try:
-            out = lut_sim(self.thresholds, self.layers, pix, self.spec, device=dev)
+            out = lut_sim(self.thresholds, self.layers, pix, self.spec, chunk=chunk, device=dev)
         except Exception as e:          # OOM, a vanished device, a stale ordinal -> numpy still works
             if dev is None:
                 raise
             print(f"[lutsim] eval on {dev} failed ({type(e).__name__}: {e}); using numpy",
                   flush=True)
-            out = lut_sim(self.thresholds, self.layers, pix, self.spec)
+            out = lut_sim(self.thresholds, self.layers, pix, self.spec, chunk=chunk)
         self._counts_memo = (pix, self.thresholds, list(self.layers), out)
         return out
 

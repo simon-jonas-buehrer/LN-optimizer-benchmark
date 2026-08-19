@@ -23,24 +23,38 @@ sin-binarized (hard = 1[sin(z)>0]); residual init (tt 0b1100, pass input A) at +
 and the gradient can move. The forward is exact boolean, so the trained (thresholds, layers) go
 straight to LutModel and predict() == the emitted netlist by construction.
 
-Implementation notes -- pure plumbing. The maths above is untouched and the trained tables come out
-bit-identical to the straightforward transcription this replaced:
+Implementation notes. The update rule, the init, the feedback distribution, the schedule and the
+early-stopping criterion above are untouched; what changed is how the step is executed. Two rules
+divide this file: the TRAINING forward may be reshaped freely (DFA already trains on continuous
+latents and evaluates on hardened tables -- that gap is the method), while everything from
+`layers_np()` onward is exact and must stay exact, because `predict()` has to be the function
+`emit_verilog()` describes.
 
   * DFA has no backward sweep, so the body layers never interact: their latents, feedback matrices
     and gradient accumulators are stored as ONE stacked tensor each (all body layers share `width`).
     The per-layer feedback matmuls become one, the per-layer scatter_adds become one, Adam sees two
-    parameters instead of `layers+1`, and DDP all-reduces two buffers instead of six. Every one of
-    those ops is elementwise or row-blocked, so stacking cannot change what they compute.
+    parameters instead of `layers+1`, and DDP all-reduces two buffers instead of six.
+  * the fixed global batch is executed as few, wide forwards instead of many tiny ones -- see
+    `_Butterfly.merge`. Same images, same gradient, same optimiser step; only how many kernel
+    launches it takes, and the order the micro-batch sums are added in.
   * the active pattern p = 2a+b is built ONCE per micro-batch, as int64, and used twice: as the
     forward's gather index into the (w, 4) table and as the gradient's scatter index. Evaluation has
     no gradient to feed, so it stays in uint8 and reads a packed 4-bit table as `(tt >> p) & 1`.
   * every buffer and every view is built once per batch shape and reused (`_Plane`): the hot loop is
-    nothing but `out=` kernels -- no allocation, no zero-fill, no tensor indexing.
+    nothing but `out=` kernels -- no allocation, no zero-fill, no tensor indexing. Which is exactly
+    what lets the whole step be captured as a CUDA graph (`_StepGraph`) on a single GPU.
   * a source-index vector that is an arithmetic progression (every body layer's `a` tap) is a
     strided view of the signal plane, not a gather; a layer that gathers both taps gathers them in
     one `index_select`.
   * nothing syncs to the host inside an epoch: the loss is a device tensor, read once per epoch and
     only on the epochs that actually print it.
+
+On CPU this is bit-identical to the straightforward transcription it replaced -- same tables, same
+early-stop epoch. On CUDA it is not, and cannot be: `scatter_add_` accumulates the wide batch with
+atomics, so the gradient is reproducible only to the last ulp (measured: identical across repeats at
+8 images per forward, different on every repeat at 256). That moves which epoch validation loss
+bottoms out, hence the extracted net, by the width of the noise. The hardened net is unaffected --
+whatever comes out, `predict()`, `scores()` and the emitted netlist agree on it exactly.
 """
 
 from __future__ import annotations
@@ -53,7 +67,7 @@ import torch
 import ddp
 from data import Dataset, DatasetSpec
 from hw import even_thresholds
-from methods.lut import LutModel, lut_sim
+from methods.lut import LutModel
 
 TITLE = "dfa (fixed butterfly wiring, direct feedback alignment)"
 
@@ -139,9 +153,6 @@ _PLANE_BUDGET = 2 << 30
 
 # Capture the optimiser step as a CUDA graph when we can (see `_StepGraph`). Off => always eager.
 _USE_CUDA_GRAPH = True
-
-# Target working set of one `lut_sim` chunk's packed signal plane (see `Dfa._sim_chunk`).
-_SIM_BYTES = 32 << 20
 
 
 def _encode(pix: torch.Tensor, thresholds) -> torch.Tensor:
@@ -371,9 +382,16 @@ class _Butterfly:
         return torch.sum(pl.read, 1, dtype=torch.float32, out=out)
 
     def layers_np(self) -> list:
-        """Extract the hard tables + fixed wiring as np.int64 (idx_a, idx_b, tt) for LutModel."""
+        """Extract the hard tables + fixed wiring as np.int64 (idx_a, idx_b, tt) for LutModel.
+
+        This is the hand-off to the exact side of the contract -- what `predict()` computes and what
+        `emit_verilog()` describes -- so it deliberately re-derives `hard_bit(z)` into FRESH tensors
+        rather than reading `tables()`' persistent buffers. Those buffers are written by the training
+        step (and by a CUDA graph replaying it); the extraction must not be able to observe them.
+        """
+        hard = self._split(hard_bit(self.z[0].detach()), hard_bit(self.z[1].detach()))
         out = []
-        for s, t in zip(self.srcs, self.tables()):
+        for s, t in zip(self.srcs, hard):
             tt = t[:, 0] | (t[:, 1] << 1) | (t[:, 2] << 2) | (t[:, 3] << 3)   # bit p = T[p]
             out.append((s[0].cpu().numpy().astype(np.int64),
                         s[1].cpu().numpy().astype(np.int64),
@@ -466,45 +484,11 @@ class Dfa(LutModel):
         # fixed global `batch` -- same protocol for every size of this method.
         self.cfg = dict(bits=bits, width=width, layers=layers, readout=readout, epochs=epochs,
                         lr=lr, batch=batch, patience=patience, micro=micro)
-        self._sim_device, self._memo = None, None
 
     def _chunk(self) -> int:
         c = self.cfg
         n_sig = self.spec.n_pixels * c["bits"] + c["width"] * c["layers"] + c["readout"]
         return max(64, min(4096, 2 ** 28 // n_sig))
-
-    def _sim_chunk(self) -> int:
-        """Images per `lut_sim` chunk: as many 64-image words as fit a ~32 MiB signal plane.
-
-        The stock 512 (8 words) makes the mid tiers re-pay numpy's per-chunk overhead a dozen times
-        over; measured on the `l` net, 32 words is ~20% faster than 8 and ~25% faster than 64. The
-        count is rounded DOWN to a power of two -- an odd word count is a bad row stride and gives
-        most of the win back -- and clamped to [8, 64] words, so the wide tiers keep exactly the 512
-        they already used and their (1.2 GiB at xxl) plane does not grow.
-        """
-        c = self.cfg
-        n_sig = self.spec.n_pixels * c["bits"] + c["width"] * c["layers"] + c["readout"]
-        w = max(8, min(64, _SIM_BYTES // (8 * max(1, n_sig))))
-        return (1 << (w.bit_length() - 1)) * 64
-
-    # ---- inference ------------------------------------------------------------------------------
-    def _counts(self, pix: np.ndarray) -> np.ndarray:
-        """LutModel's exact simulation with the two knobs it does not expose: which device, and how
-        big a chunk.
-
-        `lut_sim`'s CUDA twin is bit-for-bit the numpy reference (the same 64-images-per-word integer
-        bit arithmetic), so predict()/scores() still describe exactly the emitted netlist -- it is
-        only faster, and the wide readout tiers are where the harness spends its measuring time.
-        The memo is LutModel's, restated because passing those knobs means not calling it: the
-        harness asks for predict(val_x) and then scores(val_x), one simulation, not two.
-        """
-        memo = self._memo
-        if memo is not None and memo[0] is pix and memo[1] is self.layers:
-            return memo[2]
-        out = lut_sim(self.thresholds, self.layers, pix, self.spec, chunk=self._sim_chunk(),
-                      device=self._sim_device)
-        self._memo = (pix, self.layers, out)
-        return out
 
     def train(self, data: Dataset, *, device: str = "cpu", seed: int = 0) -> None:
         # Multi-GPU is opt-in via `ddp_gpus` (set by the harness). <=1 GPU runs `_worker` inline, so
@@ -515,9 +499,9 @@ class Dfa(LutModel):
         self.thresholds, self.layers = res["thresholds"], res["layers"]
         self.train_seconds = res["train_seconds"]  # pure training time (no val/measure)
         self._data = None                          # don't keep the dataset pinned to the model
-        # the packed simulator has a bit-identical CUDA twin; use it when we have a GPU
-        if str(device) != "cpu" and torch.cuda.is_available():
-            self._sim_device = device
+        # tell LutModel where to evaluate: its `lut_sim` has a bit-identical CUDA twin, and it owns
+        # the crossover gate (small nets lose to numpy) and the numpy fallback.
+        self.sim_device = device
 
     @torch.no_grad()
     def _worker(self, rank: int, world: int) -> dict:
