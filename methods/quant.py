@@ -294,7 +294,8 @@ class QuantModel:
                 if rank == 0:
                     print(f"  early stop at epoch {ep + 1}", flush=True)
                 break
-        net.load_state_dict(best_state)
+        if best_state is not None:      # None only when epochs == 0 (a structure-only probe)
+            net.load_state_dict(best_state)
         return net, train_secs, nseen
 
 
