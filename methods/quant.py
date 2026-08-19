@@ -76,9 +76,12 @@ _LADDER = {
     "xs": (64,),
     "s": (256,),
     "m": (512, 512),
-    "l": (1024, 1024),
-    "xl": (2048, 2048, 2048),
-    "xxl": (4096, 4096, 4096),
+    # l, xl and xxl are REMOVED. Two measured points (xs -> 1,340,211 gates / 438 s / 9.0 GB and
+    # s -> 4,920,946 gates / 2250 s / 34.9 GB) pin this ladder at ~24 gates per weight term, with
+    # synthesis time growing as gates^1.26 and peak RSS as gates^1.04. That puts l at ~45M gates,
+    # ~10 h and ~351 GB on MNIST -- and CIFAR10, whose 3072 inputs make every layer wider, at ~102M
+    # gates and ~790 GB, more memory than any node in the partition has. xl and xxl need ~2 TB and
+    # ~8 TB. m is the last rung that fits (CIFAR10 m: ~44M gates, ~10 h, ~347 GB).
 }
 
 

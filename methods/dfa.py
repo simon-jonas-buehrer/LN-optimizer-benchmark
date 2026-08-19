@@ -82,7 +82,13 @@ _LADDER = {
     "m":   (1024, 5, 5120),        #    10,240
     "l":   (2048, 5, 90000),       #   100,240
     "xl":  (4096, 5, 1_000_000),   # 1,020,480
-    "xxl": (8192, 5, 20_000_000),  # 20,040,960
+    # xxl (8192, 5, 20M) is REMOVED. Two independent reasons. (1) It cannot be synthesized: yosys
+    # must instantiate and structurally hash every readout gate before merging them, and the
+    # measured l tier (90,000 readout instances) already costs 51 GB -- 20M instances is ~222x that.
+    # (2) It would not be a bigger circuit anyway: the readout taps are (2j)%width, (2j+1)%width, so
+    # only width/2 = 4,096 distinct input pairs exist and, with 16 possible 2-input truth tables,
+    # at most 8*width = 65,536 DISTINCT readout gates -- against 20M instances, i.e. ~4,883 replicas
+    # each. Measured at l: 22,988 gates against the 100,240 the formula above predicts.
 }
 
 

@@ -42,7 +42,7 @@ module top (input [port_bits-1:0] pix, output [cls_bits-1:0] cls);   // combinat
 Every model is synthesized with the **same fast ABC script** (`harness.FAST = strash;dc2;map`): one
 strash, one `dc2`, and a technology map to NAND2+INV. It is deliberately fast and imperfect — it folds
 away dead and constant logic and does a cheap resubstitution, but does not run the multi-pass `resyn2`
-sweep — so a ~20M-gate design still maps in bounded time and every method gets exactly the same effort.
+sweep — so a multi-million-gate design still maps in bounded time and every method gets the same effort.
 The script is a constant, not a tunable.
 
 Because the optimizer deletes whatever you wasted (dead gates, constant logic, an unread pixel), **you
@@ -53,7 +53,7 @@ pay for the circuit you need, not the one you wrote.**
 * Train on `data.train_*`; tune / early-stop on `data.val_*`. **Never fit on the test set.**
 * Any optimizer, any architecture, any seed, any compute. The axes are gates and accuracy.
 * Every method trains to convergence with early stopping on **validation loss**, and reports **≥5
-  size points** spanning as much of the ~1k → ~20M gate range as it reaches (sizes are targeted by the
+  size points** spanning as much of the size range as it reaches (sizes are targeted by the
   *pre-optimization* gate estimate; the reduced count is only known after ABC).
 
 ## Reproducing

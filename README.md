@@ -16,7 +16,7 @@ on the same axis.
 ## The methods
 
 Five gradient / gradient-free logic-net optimizers, plus three quantized-MLP references, each swept
-over **≥5 sizes** targeting ~1k → ~20M gates. Every point trains to convergence with **early stopping
+over **≥3 sizes** spanning ~200 → ~5M measured gates. Every point trains to convergence with **early stopping
 on validation loss**.
 
 | method | what it searches |

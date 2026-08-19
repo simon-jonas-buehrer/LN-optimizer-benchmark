@@ -60,8 +60,13 @@ _LADDER = {
     "s": (1, (1024, 1024, 320)),
     "m": (3, (2048, 2048, 2048, 640)),
     "l": (3, (4096, 4096, 4096, 4096, 1280)),
-    "xl": (7, (250_000, 250_000, 250_000, 250_000, 25_000)),
-    "xxl": (7, (5_000_000, 5_000_000, 5_000_000, 5_000_000, 500_000)),
+    # xl and xxl are REMOVED -- they cannot finish, and the limit is early stopping, not the wall
+    # clock alone. Stopping needs `eval_every` * `patience` = 5000 * 20 = 100,000 generations with no
+    # improvement, so 100,000 generations is a FLOOR on runtime, not an average. Measured on real
+    # data: 2.66 s/generation at xl, i.e. a floor of 73.9 h against a 48 h job -- unreachable however
+    # training goes -- and xxl is 20x larger again. The jump from l (17,664 nodes) to the old xl
+    # (1,025,000 nodes) was also 58x, far past where a mutation-and-select search over 2-input LUTs
+    # does anything useful.
 }
 
 _EMPTY = np.zeros(0, np.int64)

@@ -49,7 +49,9 @@ _LADDER = {
     "m": (3, (26000, 13000)),
     "l": (3, (160000, 80000, 40000)),
     "xl": (7, (1_000_000, 500_000, 250_000)),
-    "xxl": (7, (11_000_000, 6_000_000, 3_000_000)),
+    # xxl (11M, 6M, 3M) = 20M LUT nodes is REMOVED: it cannot be measured inside a 48 h job.
+    # Extrapolating the measured l point (280k nodes -> 11.2 MB .sv, 196 s, 11.4 GB) at the fitted
+    # exponents gives ~14 h of synthesis and ~2 TB of peak RSS for 20M nodes; the nodes have 515 GB.
 }
 
 _SIM_MEM = 1 << 30       # signal-buffer budget per image chunk (bytes)

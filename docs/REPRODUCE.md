@@ -97,6 +97,21 @@ can never reach the plots; the process still exits non-zero with a list of what 
   and memory grow faster than linearly in the gate count.
 * **24 GB GPU ceiling.** The biggest logic nets may not fit a single 3090 in training; cap such a
   method at the largest size that fits and note it — the *union* of methods still spans the range.
+* **Why each ladder stops where it does.** The tiers are bounded by what can be trained AND
+  measured inside one 48 h job, which was established by measurement rather than assumed:
+
+  | method | top tier | what bounds it |
+  |---|---|---|
+  | backprop, es, dfa | `xl` | `xxl` = 20M LUT nodes needs ~2 TB of yosys RSS; nodes have 515 GB |
+  | genetic | `l` | early stopping needs 100,000 generations minimum = 74 h floor at the old `xl` |
+  | quant | `m` | `l` needs ~790 GB on CIFAR10, `xl`/`xxl` need ~2 TB / ~8 TB |
+  | forest | `xxl` | nothing -- it is cheap throughout, and its own early stopping caps it at ~635k gates |
+
+  Two of these are ceilings of the *method*, not of the hardware, and are findings in themselves:
+  dfa's readout replicates rather than grows above `m` (only `width/2` distinct input pairs exist,
+  so at most `8*width` distinct readout gates), and forest's boosting early-stops at 56 of 1,200
+  rounds, so its top tiers converge to the same circuit. Both were measured, not extrapolated.
+
 * **Quantized references** sit at the high-gate end and do not reach ~1k gates (an arithmetic
   floor); their curves start higher, which is reported, not forced.
 * **CIFAR10 is hard for logic nets** — low absolute accuracy is expected and is itself a finding.
