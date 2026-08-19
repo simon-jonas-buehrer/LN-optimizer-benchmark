@@ -317,6 +317,7 @@ class Backprop(LutModel):
         res = ddp.launch(self._worker, getattr(self, "ddp_gpus", 1))
         self.thresholds, self.layers = res["thresholds"], res["layers"]
         self.train_seconds = res["train_seconds"]  # pure training time (no val/measure), for the json
+        self.train_samples = res["train_samples"]  # training-example evals until early stop
         self._counts_memo = None
         self._data = None  # only needed to reach the worker; don't pin the dataset afterwards
 
@@ -342,7 +343,7 @@ class Backprop(LutModel):
         work = (c["epochs"] * -(-n_train // (step * accum))        # optimiser steps
                 * (step * accum // world) * 2 * c["cands"] * sum(c["widths"]))   # elems per step
         _GS = _compiled_gs(device, m.act) if self._use_compile(work) else _gs_kernel
-        best, best_state, best_ep, train_secs = float("inf"), None, 0, 0.0
+        best, best_state, best_ep, train_secs, nseen = float("inf"), None, 0, 0.0, 0
         for ep in range(c["epochs"]):
             perm = torch.randperm(n_train, device=device)  # same on every rank (same seed)
             t0 = time.perf_counter()
@@ -364,6 +365,7 @@ class Backprop(LutModel):
             if ex.is_cuda:
                 torch.cuda.synchronize(device)
             train_secs += time.perf_counter() - t0
+            nseen += n_train  # training-example forward passes this epoch (samples looked at)
             sched.step()
             # early stop on val LOSS (forward is already hard = the circuit). Compute it on rank 0
             # only and broadcast, so every rank breaks on the SAME number (GPU reductions differ in
@@ -404,7 +406,8 @@ class Backprop(LutModel):
             wires = [lay.wires().cpu().numpy() for lay in m.layers]
             layers = [(w[0], w[1], lay.truth_table().cpu().numpy())
                       for w, lay in zip(wires, m.layers)]
-        return {"thresholds": m.thresholds, "train_seconds": train_secs, "layers": layers}
+        return {"thresholds": m.thresholds, "train_seconds": train_secs, "train_samples": nseen,
+                "layers": layers}
 
     def _counts(self, pix: np.ndarray) -> np.ndarray:
         """On a CUDA run, evaluate through lut_sim's GPU backend (bit-for-bit equal to numpy).

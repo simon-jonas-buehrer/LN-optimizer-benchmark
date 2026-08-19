@@ -493,7 +493,7 @@ class Genetic(LutModel):
         val_packed = None                       # the val set is encoded+packed once, not per eval
 
         best_ce, best_srcs, stale = float("inf"), [s.copy() for s in srcs], 0
-        t0, train_secs = time.time(), 0.0  # train_secs: only the search, never the val evals
+        t0, train_secs, nseen = time.time(), 0.0, 0  # train_secs: only the search, not the val evals
         for gen in range(c["gens"]):
             ts = time.perf_counter()
             idx = rng.integers(0, len(data.train_x), size=c["batch"])
@@ -512,6 +512,7 @@ class Genetic(LutModel):
                 if gpu:
                     sim.commit(winner)          # keep the device wiring in step with `srcs`
             train_secs += time.perf_counter() - ts
+            nseen += c["k"] * c["batch"]  # k candidates each scored on `batch` samples this gen
 
             if (gen + 1) % c["eval_every"] == 0 or gen + 1 == c["gens"]:
                 if val_packed is None:
@@ -532,6 +533,7 @@ class Genetic(LutModel):
         self.thresholds = thresholds
         self.layers = layers(best_srcs)
         self.train_seconds = train_secs
+        self.train_samples = nseen  # training-example evals until early stop
 
 
 def build(spec, **point) -> Genetic:

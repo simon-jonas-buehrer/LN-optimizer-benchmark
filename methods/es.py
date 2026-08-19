@@ -329,7 +329,7 @@ class ES(LutModel):
         best, best_theta, best_gen = float("inf"), theta.copy(), 0
         half = c["pop"] // 2
         keep_eps = half * G * 16 <= _EPS_MEM   # cache a generation's perturbations if they fit
-        train_secs = 0.0  # only the ES search (fitness + update), never the val evals
+        train_secs, nseen = 0.0, 0  # only the ES search (fitness + update), never the val evals
         for gen in range(c["gens"]):
             t0 = time.perf_counter()
             sel = rng.integers(0, len(data.train_x), c["batch"])
@@ -361,6 +361,7 @@ class ES(LutModel):
                     grad[b:b + _GRAD_BLK] += w * eps[b:b + _GRAD_BLK]
             theta += np.float32(c["lr"] / (c["pop"] * c["sigma"])) * grad
             train_secs += time.perf_counter() - t0
+            nseen += c["pop"] * c["batch"]  # pop candidates each scored on `batch` samples this gen
 
             if gen % c["eval_every"] == 0 or gen == c["gens"] - 1:
                 if val_packed is None:
@@ -377,6 +378,7 @@ class ES(LutModel):
         self.thresholds = thr
         self.layers = _layers(best_theta, wires, self.widths)
         self.train_seconds = train_secs
+        self.train_samples = nseen  # training-example evals until early stop
 
 
 def build(spec, **point) -> ES:

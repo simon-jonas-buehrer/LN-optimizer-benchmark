@@ -478,10 +478,14 @@ class Dfa(LutModel):
 
     def __init__(self, spec: DatasetSpec, bits: int, width: int, layers: int, readout: int,
                  epochs: int, lr: float = 0.01, batch: int = 256, patience: int = 12,
-                 micro: int = 8) -> None:
+                 micro: int = 1) -> None:
         super().__init__(spec)
-        # `micro` = per-GPU micro-batch (small enough for the 20M-gate readout), accumulated to the
-        # fixed global `batch` -- same protocol for every size of this method.
+        # `micro` = per-GPU micro-batch, accumulated to the fixed global `batch` (same effective
+        # batch, hence identical result, for every size -- micro only sets accumulation granularity).
+        # micro=1 keeps the 20M-gate xxl tier at ~16.4 GiB/GPU WITH the CUDA graph on (measured on the
+        # real trainer): the graph's captured memory pool is what OOMs 24 GB at micro>=2. Smaller
+        # tiers have a tiny plane, so `merge` still fuses their whole batch into one graph -- they are
+        # unaffected; only xxl falls back to one-image steps, which is the price of fitting 24 GB.
         self.cfg = dict(bits=bits, width=width, layers=layers, readout=readout, epochs=epochs,
                         lr=lr, batch=batch, patience=patience, micro=micro)
 
@@ -498,6 +502,7 @@ class Dfa(LutModel):
         res = ddp.launch(self._worker, getattr(self, "ddp_gpus", 1))
         self.thresholds, self.layers = res["thresholds"], res["layers"]
         self.train_seconds = res["train_seconds"]  # pure training time (no val/measure)
+        self.train_samples = res["train_samples"]  # training-example evals until early stop
         self._data = None                          # don't keep the dataset pinned to the model
         # tell LutModel where to evaluate: its `lut_sim` has a bit-identical CUDA twin, and it owns
         # the crossover gate (small nets lose to numpy) and the numpy fallback.
@@ -541,7 +546,7 @@ class Dfa(LutModel):
                   f"{net.plane_bytes() * step // world / 2**20:.0f} MiB scratch"
                   f"{', cuda graph' if gstep else ''})", flush=True)
         best, best_z, best_ep = float("inf"), [z.detach().clone() for z in net.z], 0
-        train_secs, t_all, loss_t = 0.0, time.time(), None
+        train_secs, t_all, loss_t, nseen = 0.0, time.time(), None, 0
         loss = float("nan")
         for ep in range(c["epochs"]):
             # the loss is a print-only quantity: compute it on the epochs that print it, and nowhere
@@ -575,6 +580,7 @@ class Dfa(LutModel):
             if device != "cpu":
                 torch.cuda.synchronize(device)
             train_secs += time.perf_counter() - t0
+            nseen += n  # training-example forward passes this epoch (samples looked at)
             sched.step()
 
             # rank-0 val loss, broadcast to all -> identical early-stop decision (no DDP deadlock)
@@ -595,7 +601,8 @@ class Dfa(LutModel):
         for z, bz in zip(net.z, best_z):
             z.copy_(bz)
         # hand the hard structure to LutModel: predict/scores/emit all read exactly these arrays
-        return {"thresholds": net.thresholds, "layers": net.layers_np(), "train_seconds": train_secs}
+        return {"thresholds": net.thresholds, "layers": net.layers_np(), "train_seconds": train_secs,
+                "train_samples": nseen}
 
     # ---- the DFA update ------------------------------------------------------------------------
     def _accum_grad(self, net: _Butterfly, enc_all: torch.Tensor, cols: torch.Tensor,

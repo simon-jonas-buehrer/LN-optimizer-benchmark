@@ -656,7 +656,12 @@ def run_point(mod: ModuleType, point: dict, data: Dataset, *, device: str, seed:
     # PURE training time: only the training compute the method measured internally (no validation, no
     # data staging, no synth/measure). This is the axis for "how fast does each method train".
     train_s = float(getattr(model, "train_seconds", train_wall_s))
-    print(f"[train] {train_s:.0f}s pure ({train_wall_s:.0f}s wall incl. val)", flush=True)
+    # samples the trainer looked at before early-stopping (training-example forward passes):
+    # epochs*Ntrain for the gradient methods, gens*pop(or k)*batch for es/genetic, rounds*Ntrain
+    # for forest. Pairs with train_s as "how long / how much data until it converged".
+    train_samples = int(getattr(model, "train_samples", 0))
+    print(f"[train] {train_s:.0f}s pure ({train_wall_s:.0f}s wall incl. val)  "
+          f"{train_samples:,} samples seen", flush=True)
 
     if hasattr(model, "save"):
         model.save(str(stem) + ".ckpt")
@@ -697,7 +702,8 @@ def run_point(mod: ModuleType, point: dict, data: Dataset, *, device: str, seed:
     sc_va = scores(data.val_x)
     out = {"name": point["name"], "method": mod.__name__.split(".")[-1], "dataset": spec.name,
            "seed": seed, "config": cfg, **m, "val_acc": round(val_acc, 2),
-           "train_s": round(train_s, 1), "train_wall_s": round(train_wall_s, 1), "device": device}
+           "train_s": round(train_s, 1), "train_wall_s": round(train_wall_s, 1),
+           "train_samples": train_samples, "device": device}
 
     if sc_te is not None:
         t = _fit_temperature(np.asarray(sc_va, float), data.val_y)

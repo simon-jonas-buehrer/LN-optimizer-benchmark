@@ -189,6 +189,7 @@ class QuantModel:
         self._data, self._seed, self._base_device = data, seed, device
         res = ddp.launch(self._worker, getattr(self, "ddp_gpus", 1))
         self.layers, self.train_seconds = res["layers"], res["train_seconds"]
+        self.train_samples = res["train_samples"]  # training-example evals until early stop
         self._gemm, self._logits = {}, {}
 
     def _worker(self, rank, world):
@@ -212,12 +213,13 @@ class QuantModel:
             torch.backends.cuda.matmul.allow_tf32 = True
             torch.backends.cudnn.allow_tf32 = True
         try:
-            net, train_secs = self._fit(net, rank, world, device, cuda, c)
+            net, train_secs, nseen = self._fit(net, rank, world, device, cuda, c)
         finally:
             torch.backends.cuda.matmul.allow_tf32, torch.backends.cudnn.allow_tf32 = tf32_was
         # eager, fp32, TF32 restored -> `export` is exactly the integer model the emitter turns
         # into gates and `predict()` recomputes.
-        return {"layers": [L.export() for L in net], "train_seconds": train_secs}
+        return {"layers": [L.export() for L in net], "train_seconds": train_secs,
+                "train_samples": nseen}
 
     def _fit(self, net, rank, world, device, cuda, c):
         """Train in place and return (net, pure_training_seconds). Training numerics are free to
@@ -250,7 +252,7 @@ class QuantModel:
                                **({"fused": True} if (_FUSED_ADAM and cuda) else {}))
         sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=c["epochs"])
         step, accum, gstep = ddp.accum_plan(c["micro"], world, c["batch"])  # gstep = global batch
-        best, best_state, best_ep, train_secs = float("inf"), None, 0, 0.0
+        best, best_state, best_ep, train_secs, nseen = float("inf"), None, 0, 0.0, 0
         n_train = x.shape[0]
         for ep in range(c["epochs"]):
             perm = torch.randperm(n_train, device=device)  # same on every rank (same seed)
@@ -266,6 +268,7 @@ class QuantModel:
             if cuda:
                 torch.cuda.synchronize(device)
             train_secs += time.perf_counter() - t0
+            nseen += n_train  # training-example forward passes this epoch (samples looked at)
             sched.step()
             # rank-0 val loss, broadcast to all -> identical early-stop decision (no DDP deadlock)
             if rank == 0:
@@ -292,7 +295,7 @@ class QuantModel:
                     print(f"  early stop at epoch {ep + 1}", flush=True)
                 break
         net.load_state_dict(best_state)
-        return net, train_secs
+        return net, train_secs, nseen
 
 
 def variant(wmode: str, abits: int):

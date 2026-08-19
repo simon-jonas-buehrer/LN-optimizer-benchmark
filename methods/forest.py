@@ -450,6 +450,8 @@ class Forest:
         self.trees = [self._collapse(t) for t in trees]
         self.w = [int(a) for a in w]
         self.train_seconds = ts1 + ts2  # pure boosting time (both passes), excluding val CE
+        # samples looked at until early stop: each kept boosting round scans the full train set
+        self.train_samples = len(self.trees) * X.shape[0]
         assert self.trees, "no tree survived boosting"
         assert min(self.w) >= 1, f"weights must be >= 1 (unsigned scores), got {min(self.w)}"
 
