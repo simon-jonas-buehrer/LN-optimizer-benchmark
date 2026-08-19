@@ -18,7 +18,9 @@ import pickle
 import numpy as np
 import torch
 import torch.nn.functional as F
+from torch.nn.parallel import DistributedDataParallel as DDP
 
+import ddp
 from data import Dataset, DatasetSpec
 from hw import QLayer, emit_quant_mlp, input_activations, qmlp_forward
 
@@ -106,21 +108,25 @@ class QuantModel:
                                     for L in self.layers]}, f)
 
     def train(self, data: Dataset, *, device="cpu", seed=0):
+        # Multi-GPU is opt-in via `ddp_gpus` (set by the harness). <=1 GPU runs `_worker` inline, so
+        # this path stays byte-for-byte the old trainer; >1 spawns one DDP rank per GPU.
+        self._data, self._seed, self._base_device = data, seed, device
+        self.layers = ddp.launch(self._worker, getattr(self, "ddp_gpus", 1))["layers"]
+
+    def _worker(self, rank, world):
+        data, seed, c = self._data, self._seed, self.cfg
+        device = self._base_device if world == 1 else f"cuda:{rank}"
         torch.manual_seed(seed)
-        c = self.cfg
-        g = torch.Generator().manual_seed(seed)
+        g = torch.Generator().manual_seed(seed)  # CPU generator -> identical init on every rank
         dims = [self.spec.n_pixels, *self.hidden, self.spec.n_classes]
         finals = [False] * (len(dims) - 2) + [True]
-        net = torch.nn.ModuleList(
-            [_Layer(dims[i], dims[i + 1], self.wmode, self.abits, finals[i], g)
-             for i in range(len(dims) - 1)]).to(device)
+        net = torch.nn.Sequential(
+            *[_Layer(dims[i], dims[i + 1], self.wmode, self.abits, finals[i], g)
+              for i in range(len(dims) - 1)]).to(device)
+        # final layer's log_s is unused (no requant on the logits), so DDP must tolerate it
+        train_net = (DDP(net, device_ids=[rank], find_unused_parameters=True) if world > 1 else net)
         opt = torch.optim.Adam(net.parameters(), lr=c["lr"])
         sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=c["epochs"])
-
-        def fwd(a):
-            for L in net:
-                a = L(a)
-            return a
 
         x = _t(self._in(data.train_x).astype(np.float32), device)
         y = _t(data.train_y, device)
@@ -128,28 +134,38 @@ class QuantModel:
         vy = _t(data.val_y, device)
         best, best_state, best_ep = float("inf"), None, 0
         for ep in range(c["epochs"]):
-            perm = torch.randperm(x.shape[0], device=device)
+            perm = torch.randperm(x.shape[0], device=device)  # same on every rank (same seed)
             for i in range(0, x.shape[0], c["batch"]):
                 idx = perm[i:i + c["batch"]]
-                loss = F.cross_entropy(fwd(x[idx]), y[idx])
+                if idx.shape[0] < world:
+                    continue
+                local = ddp.shard(idx, rank, world)
+                loss = F.cross_entropy(train_net(x[local]), y[local])
                 opt.zero_grad(set_to_none=True)
                 loss.backward()
                 opt.step()
             sched.step()
-            with torch.no_grad():
-                vl = sum(F.cross_entropy(fwd(vx[i:i + 4096]), vy[i:i + 4096], reduction="sum").item()
-                         for i in range(0, vx.shape[0], 4096)) / vx.shape[0]
+            # rank-0 val loss, broadcast to all -> identical early-stop decision (no DDP deadlock)
+            if rank == 0:
+                with torch.no_grad():
+                    vl = sum(F.cross_entropy(net(vx[i:i + 4096]), vy[i:i + 4096],
+                                             reduction="sum").item()
+                             for i in range(0, vx.shape[0], 4096)) / vx.shape[0]
+            else:
+                vl = 0.0
+            vl = ddp.broadcast_float(vl)
             if vl < best - 1e-4:
                 best, best_ep = vl, ep
                 best_state = {k: v.detach().clone() for k, v in net.state_dict().items()}
-            if ep % 5 == 0 or ep == c["epochs"] - 1:
+            if rank == 0 and (ep % 5 == 0 or ep == c["epochs"] - 1):
                 print(f"  epoch {ep + 1:3d}/{c['epochs']}  val loss {vl:.4f}  (best {best:.4f} @ {best_ep + 1})",
                       flush=True)
             if ep - best_ep >= c["patience"]:
-                print(f"  early stop at epoch {ep + 1}", flush=True)
+                if rank == 0:
+                    print(f"  early stop at epoch {ep + 1}", flush=True)
                 break
         net.load_state_dict(best_state)
-        self.layers = [L.export() for L in net]
+        return {"layers": [L.export() for L in net]}
 
 
 def variant(wmode: str, abits: int):

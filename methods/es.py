@@ -75,8 +75,9 @@ class ES(LutModel):
         self.cfg = dict(gens=gens, pop=pop, sigma=sigma, lr=lr, batch=batch,
                         patience=patience, eval_every=eval_every)
 
-    def _val_loss(self, theta, wires, vx, vy) -> float:
-        counts = lut_sim(even_thresholds(self.bits), _layers(theta, wires, self.widths), vx, self.spec)
+    def _val_loss(self, theta, wires, vx, vy, device=None) -> float:
+        counts = lut_sim(even_thresholds(self.bits), _layers(theta, wires, self.widths), vx,
+                         self.spec, device=device)
         z = counts - counts.max(1, keepdims=True)
         logp = z - np.log(np.exp(z).sum(1, keepdims=True))
         return float(-logp[np.arange(len(vy)), vy].mean())
@@ -91,7 +92,7 @@ class ES(LutModel):
         theta = rng.standard_normal((G, 4)).astype(np.float32) * 0.1
 
         def fit(th, xb, yb):  # negative CE on a minibatch of the hardened net (higher = better)
-            counts = lut_sim(thr, _layers(th, wires, self.widths), xb, self.spec)
+            counts = lut_sim(thr, _layers(th, wires, self.widths), xb, self.spec, device=device)
             z = counts - counts.max(1, keepdims=True)
             logp = z - np.log(np.exp(z).sum(1, keepdims=True))
             return float(logp[np.arange(len(yb)), yb].mean())
@@ -115,7 +116,7 @@ class ES(LutModel):
             theta += c["lr"] / (c["pop"] * c["sigma"]) * grad
 
             if gen % c["eval_every"] == 0 or gen == c["gens"] - 1:
-                vl = self._val_loss(theta, wires, data.val_x, data.val_y)
+                vl = self._val_loss(theta, wires, data.val_x, data.val_y, device)
                 if vl < best - 1e-4:
                     best, best_gen, best_theta = vl, gen, theta.copy()
                 print(f"  gen {gen + 1:5d}/{c['gens']}  val loss {vl:.4f}  (best {best:.4f} @ {best_gen + 1})",

@@ -100,7 +100,8 @@ class Genetic(LutModel):
 
         tt = [np.full(w, NAND_TT, np.int64) for w in widths]  # constant: only the wiring is learned
         layers = lambda g: [(gi[0], gi[1], ti) for gi, ti in zip(g, tt)]
-        counts = lambda g, x: lut_sim(thresholds, layers(g), x, spec)  # (N, n_classes) via the sim
+        # (N, n_classes) via the sim; device routes the hot loop to the GPU (es/genetic live here)
+        counts = lambda g, x: lut_sim(thresholds, layers(g), x, spec, device=device)
 
         best_ce, best_srcs, stale = float("inf"), [s.copy() for s in srcs], 0
         t0 = time.time()

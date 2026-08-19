@@ -31,6 +31,7 @@ import time
 import numpy as np
 import torch
 
+import ddp
 from data import Dataset, DatasetSpec
 from hw import even_thresholds
 from methods.lut import LutModel
@@ -184,11 +185,20 @@ class Dfa(LutModel):
         n_sig = self.spec.n_pixels * c["bits"] + c["width"] * c["layers"] + c["readout"]
         return max(64, min(4096, 2 ** 28 // n_sig))
 
-    @torch.no_grad()
     def train(self, data: Dataset, *, device: str = "cpu", seed: int = 0) -> None:
-        c = self.cfg
+        # Multi-GPU is opt-in via `ddp_gpus` (set by the harness). <=1 GPU runs `_worker` inline, so
+        # this path is byte-for-byte the old DFA trainer; >1 shards each batch across ranks and
+        # all-reduces the hand-written gradient (below), which is exactly the full-batch gradient.
+        self._data, self._seed, self._base_device = data, seed, device
+        res = ddp.launch(self._worker, getattr(self, "ddp_gpus", 1))
+        self.thresholds, self.layers = res["thresholds"], res["layers"]
+
+    @torch.no_grad()
+    def _worker(self, rank: int, world: int) -> dict:
+        data, seed, c = self._data, self._seed, self.cfg
+        device = self._base_device if world == 1 else f"cuda:{rank}"
         torch.manual_seed(seed)
-        g = torch.Generator(device=device).manual_seed(seed)
+        g = torch.Generator(device=device).manual_seed(seed)  # same draws on every rank (seed-only)
         net = _Butterfly(self.spec, c["bits"], c["width"], c["layers"], c["readout"], device, g)
 
         enc_tr = _encode(_t(data.train_x, device), net.thresholds)   # (n_in, N)
@@ -205,33 +215,41 @@ class Dfa(LutModel):
         steps = max(1, n // c["batch"])
         best, best_z, best_ep, t0 = float("inf"), [z.detach().clone() for z in net.z], 0, time.time()
         for ep in range(c["epochs"]):
-            perm = torch.randperm(n, generator=g, device=device)
+            perm = torch.randperm(n, generator=g, device=device)  # identical on every rank
             for i in range(steps):
                 idx = perm[i * c["batch"] : (i + 1) * c["batch"]]
-                loss = self._step(net, enc_tr[:, idx], y_tr[idx], opt)
+                if idx.shape[0] < world:
+                    continue
+                local = ddp.shard(idx, rank, world)
+                loss = self._step(net, enc_tr[:, local], y_tr[local], opt, local.shape[0] * world)
             sched.step()
 
-            vl = self._val_loss(net, enc_va, y_va)  # early stop on val LOSS (forward is the circuit)
+            # rank-0 val loss, broadcast to all -> identical early-stop decision (no DDP deadlock)
+            vl = ddp.broadcast_float(self._val_loss(net, enc_va, y_va) if rank == 0 else 0.0)
             if vl < best - 1e-4:
                 best, best_ep = vl, ep
                 best_z = [z.detach().clone() for z in net.z]
-            if ep % 5 == 0 or ep == c["epochs"] - 1:
+            if rank == 0 and (ep % 5 == 0 or ep == c["epochs"] - 1):
                 print(f"  epoch {ep + 1:3d}/{c['epochs']}  loss {loss:.3f}  val loss {vl:.4f}  "
                       f"(best {best:.4f} @ {best_ep + 1})  "
                       f"{(ep + 1) / (time.time() - t0):.2f} ep/s", flush=True)
             if ep - best_ep >= c["patience"]:
-                print(f"  early stop at epoch {ep + 1}: no gain since {best_ep + 1}", flush=True)
+                if rank == 0:
+                    print(f"  early stop at epoch {ep + 1}: no gain since {best_ep + 1}", flush=True)
                 break
 
         for z, bz in zip(net.z, best_z):
             z.copy_(bz)
         # hand the hard structure to LutModel: predict/scores/emit all read exactly these arrays
-        self.thresholds = net.thresholds
-        self.layers = net.layers_np()
+        return {"thresholds": net.thresholds, "layers": net.layers_np()}
 
     # ---- the DFA update ------------------------------------------------------------------------
-    def _step(self, net: _Butterfly, enc: torch.Tensor, y: torch.Tensor, opt) -> float:
-        """One direct-feedback-alignment step. No graph, no .backward(), no cross-layer signal."""
+    def _step(self, net: _Butterfly, enc: torch.Tensor, y: torch.Tensor, opt, nglobal: int) -> float:
+        """One direct-feedback-alignment step. No graph, no .backward(), no cross-layer signal.
+
+        Under DDP each rank runs this on its slice of the global batch; normalising the error by the
+        GLOBAL count `nglobal` and SUM-all-reducing each layer's raw gradient `G` reconstructs exactly
+        the single-process full-batch gradient (all-reduce is a no-op when not distributed)."""
         B = enc.shape[1]
         nc = self.spec.n_classes
         T = net.tables()
@@ -244,7 +262,7 @@ class Dfa(LutModel):
         loss = -torch.log(prob[ar, y] + 1e-12).mean()
         e = prob.clone()
         e[ar, y] -= 1.0
-        e /= B                                                  # mean over the batch
+        e /= nglobal                                            # mean over the GLOBAL batch
 
         for l, w in enumerate(net.widths):
             s = net.srcs[l]
@@ -259,6 +277,7 @@ class Dfa(LutModel):
             G = torch.zeros(w * 4, device=enc.device)
             idx = torch.arange(w, device=enc.device)[:, None] * 4 + p   # (w, B)
             G.scatter_add_(0, idx.reshape(-1), delta.t().reshape(-1))
+            ddp.all_reduce_(G)  # sum this rank's slice into the full-batch gradient (no-op if 1 GPU)
             net.z[l].grad = G.view(w, 4) * (0.5 * torch.cos(net.z[l]))
 
         opt.step()

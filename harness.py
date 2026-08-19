@@ -231,7 +231,7 @@ def run(net: NandNet, x_bits: np.ndarray, spec: DatasetSpec, chunk: int = 4096) 
         for lv, (a, b) in enumerate(zip(net.src_a, net.src_b)):
             acts[net.offs[lv]:net.offs[lv + 1]] = ~(acts[a] & acts[b])
         out = np.unpackbits(acts[net.out_sig].view(np.uint8), axis=1, bitorder="little")
-        cls = (out.astype(np.int64) << np.arange(len(net.out_sig), np.int64)[:, None]).sum(0)
+        cls = (out.astype(np.int64) << np.arange(len(net.out_sig), dtype=np.int64)[:, None]).sum(0)
         preds.append(cls[:n])
     pred = np.concatenate(preds)
     if (pred >= spec.n_classes).any():
@@ -298,13 +298,15 @@ def measure(sv: Path, data: Dataset) -> tuple[dict, NandNet]:
     return m, net
 
 
-def run_point(mod: ModuleType, point: dict, data: Dataset, *, device: str, seed: int) -> dict:
+def run_point(mod: ModuleType, point: dict, data: Dataset, *, device: str, seed: int,
+              gpus: int = 1) -> dict:
     spec = data.spec
     cfg = {k: v for k, v in point.items() if k != "name"}
     print(f"\n=== {spec.name}/{mod.__name__.split('.')[-1]}/{point['name']}  {cfg}  seed={seed}",
           flush=True)
     model = mod.build(spec, **cfg)
     model.spec = spec
+    model.ddp_gpus = gpus  # torch methods use one DDP rank per GPU; the rest ignore it
     stem = _stem(mod.__name__.split(".")[-1], spec.name, point["name"], seed)
 
     t0 = time.time()
@@ -348,7 +350,7 @@ def run_point(mod: ModuleType, point: dict, data: Dataset, *, device: str, seed:
 
 
 def run_method(name: str, data: Dataset, *, device: str, seed: int,
-               only: list[str] | None, force: bool) -> None:
+               only: list[str] | None, force: bool, gpus: int = 1) -> None:
     mod = load_method(name)
     for point in mod.points(data.spec):
         if only and point["name"] not in only:
@@ -357,7 +359,7 @@ def run_method(name: str, data: Dataset, *, device: str, seed: int,
         if Path(str(stem) + ".json").exists() and not force:
             print(f"=== {data.spec.name}/{name}/{point['name']}: done, skipping (--force)", flush=True)
             continue
-        run_point(mod, point, data, device=device, seed=seed)
+        run_point(mod, point, data, device=device, seed=seed, gpus=gpus)
 
 
 def rescore_method(name: str, data: Dataset, seed: int) -> None:

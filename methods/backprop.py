@@ -11,7 +11,9 @@ from __future__ import annotations
 import numpy as np
 import torch
 import torch.nn.functional as F
+from torch.nn.parallel import DistributedDataParallel as DDP
 
+import ddp
 from data import Dataset, DatasetSpec
 from hw import even_thresholds
 from methods.lut import LutModel
@@ -108,9 +110,18 @@ class Backprop(LutModel):
         return max(64, min(2048, 2 ** 28 // (2 * max(self.cfg["widths"]) * self.cfg["cands"])))
 
     def train(self, data: Dataset, *, device="cpu", seed=0):
-        torch.manual_seed(seed)
-        c = self.cfg
+        # Multi-GPU is opt-in via `ddp_gpus` (set by the harness). ddp.launch runs `_worker` on one
+        # process per GPU; with <=1 GPU it runs inline -> this path is byte-for-byte the old trainer.
+        self._data, self._seed, self._base_device = data, seed, device
+        res = ddp.launch(self._worker, getattr(self, "ddp_gpus", 1))
+        self.thresholds, self.layers = res["thresholds"], res["layers"]
+
+    def _worker(self, rank, world):
+        data, seed, c = self._data, self._seed, self.cfg
+        device = self._base_device if world == 1 else f"cuda:{rank}"
+        torch.manual_seed(seed)  # identical seed on every rank -> identical init AND identical perm
         m = _Net(self.spec, c["bits"], c["widths"], c["cands"], seed).to(device)
+        train_m = DDP(m, device_ids=[rank]) if world > 1 else m  # DDP averages grads across ranks
         opt = torch.optim.Adam(m.parameters(), lr=c["lr"])
         sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=c["epochs"])
         x, y = _t(data.train_x, device), _t(data.train_y, device)
@@ -118,30 +129,41 @@ class Backprop(LutModel):
         ch = self._chunk()
         best, best_state, best_ep = float("inf"), None, 0
         for ep in range(c["epochs"]):
-            perm = torch.randperm(x.shape[0], device=device)
+            perm = torch.randperm(x.shape[0], device=device)  # same on every rank (same seed)
             for i in range(0, x.shape[0], c["batch"]):
                 idx = perm[i:i + c["batch"]]
-                loss = F.cross_entropy(m(x[idx]), y[idx])
+                if idx.shape[0] < world:  # too small to split evenly; all ranks skip in lockstep
+                    continue
+                local = ddp.shard(idx, rank, world)  # equal contiguous slice; DDP mean == full mean
+                loss = F.cross_entropy(train_m(x[local]), y[local])
                 opt.zero_grad(set_to_none=True)
                 loss.backward()
                 opt.step()
             sched.step()
-            with torch.no_grad():  # early stop on val LOSS (forward is already hard = the circuit)
-                vl = sum(F.cross_entropy(m(vx[i:i + ch]), vy[i:i + ch], reduction="sum").item()
-                         for i in range(0, vx.shape[0], ch)) / vx.shape[0]
+            # early stop on val LOSS (forward is already hard = the circuit). Compute it on rank 0
+            # only and broadcast, so every rank breaks on the SAME number (GPU reductions differ in
+            # the last bits across devices, and a diverging break would deadlock DDP).
+            if rank == 0:
+                with torch.no_grad():
+                    vl = sum(F.cross_entropy(m(vx[i:i + ch]), vy[i:i + ch], reduction="sum").item()
+                             for i in range(0, vx.shape[0], ch)) / vx.shape[0]
+            else:
+                vl = 0.0
+            vl = ddp.broadcast_float(vl)
             if vl < best - 1e-4:
                 best, best_ep = vl, ep
                 best_state = {k: v.detach().clone() for k, v in m.state_dict().items()}
-            if ep % 5 == 0 or ep == c["epochs"] - 1:
+            if rank == 0 and (ep % 5 == 0 or ep == c["epochs"] - 1):
                 print(f"  epoch {ep + 1:3d}/{c['epochs']}  val loss {vl:.4f}  (best {best:.4f} @ {best_ep + 1})",
                       flush=True)
             if ep - best_ep >= c["patience"]:
-                print(f"  early stop at epoch {ep + 1}", flush=True)
+                if rank == 0:
+                    print(f"  early stop at epoch {ep + 1}", flush=True)
                 break
         m.load_state_dict(best_state)
-        self.thresholds = m.thresholds
-        self.layers = [(lay.wires()[0].cpu().numpy(), lay.wires()[1].cpu().numpy(),
-                        lay.truth_table().cpu().numpy()) for lay in m.layers]
+        return {"thresholds": m.thresholds,
+                "layers": [(lay.wires()[0].cpu().numpy(), lay.wires()[1].cpu().numpy(),
+                            lay.truth_table().cpu().numpy()) for lay in m.layers]}
 
 
 def build(spec, **point) -> Backprop:
