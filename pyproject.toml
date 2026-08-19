@@ -1,23 +1,17 @@
 [project]
-name = "mnistbench"
+name = "asic-scaling-laws"
 version = "0.1.0"
-description = "Benchmark optimizers by the silicon their solutions cost: MNIST accuracy vs sky130 gate equivalents."
+description = "How different optimizers and models scale in ASIC gate count for MNIST and CIFAR10 classification."
 readme = "README.md"
 requires-python = ">=3.10"
 
-# The harness needs numpy and nothing else. It never imports a deep-learning framework, so a
-# submission is free to use torch, JAX, TensorFlow or none of them -- everything crossing the
-# boundary (images in, predictions out) is a numpy array.
-dependencies = ["numpy>=1.24"]
+# The harness is numpy-only; training the neural methods needs torch; the plots need matplotlib.
+dependencies = ["numpy>=1.24", "torch>=2.2", "matplotlib>=3.7"]
 
-[project.optional-dependencies]
-plot = ["matplotlib>=3.7"]        # only for `python -m mnistbench pareto`
-records = ["torch>=2.2"]          # only for the two reference records under records/sbuehrer/
-jax = ["jax>=0.4", "tyro>=0.8"]   # only for records/nherr/ga and records/dmuglich/did
-
-# Scoring also needs yosys + ABC and the sky130 liberty, which are not pip-installable:
+# Measuring circuits also needs yosys + ABC (with the sky130 liberty only for the optional GE
+# metric); these are not pip-installable:
 #   conda create -n eda -c conda-forge -c litex-hub yosys open_pdks.sky130a
-# See docs/RULES.md.
+# See docs/REPRODUCE.md.
 
 [tool.uv]
 package = false

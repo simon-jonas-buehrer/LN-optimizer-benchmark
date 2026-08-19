@@ -1,18 +1,17 @@
-# python
-.venv/
-__pycache__/
-*.pyc
-.ruff_cache/
-.pytest_cache/
-
-# MNIST is downloaded on first run, not committed
-data/
-
-# local scratch and cluster job logs
+# cluster-specific launchers and paths -- never part of the public repo
 .local/
 
-# Generated Verilog: big, and it regenerates from submission.py + the seed. results.json is the
-# record of what was measured, and IS committed -- along with the Pareto plot in results/.
-records/*/*/artifacts/
-*.pt
-*.pkl
+# downloaded datasets
+/data/
+
+# large per-model artifacts (regenerated); the small .json metrics and the plots ARE committed
+results/**/*.sv
+results/**/*.ckpt
+
+# python
+__pycache__/
+*.pyc
+.venv/
+*.egg-info/
+build/
+dist/
