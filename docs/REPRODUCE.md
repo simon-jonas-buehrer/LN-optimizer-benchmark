@@ -75,10 +75,26 @@ can never reach the plots; the process still exits non-zero with a list of what 
 
 * **GPU trains, CPU synthesizes.** yosys+ABC is single-threaded per point and CPU-bound; the GPUs
   do not help there. The largest tiers dominate wall-clock even under the fast script.
-* **Synthesis memory is the hard ceiling, not GPU memory.** Measured with this repo's emitters:
-  a 3.9 MB `.sv` peaks at ~3 GB of yosys RSS, a 15.9 MB `.sv` at ~14 GB — roughly **1 GB of RAM per
-  MB of emitted Verilog**, and both time and memory grow faster than linearly in the gate count.
-  Size the machine (or the SLURM `--mem`) against the `.sv`, not against the model.
+* **Synthesis memory is the hard ceiling, not GPU memory** — and `.sv` size does not predict it.
+  Measured peak yosys RSS per MB of emitted Verilog, across this repo's own emitters:
+
+  | method | point | `.sv` | peak RSS | GB per MB |
+  |---|---|---|---|---|
+  | forest | xl | 7.5 MB | 3.6 GB | 0.5 |
+  | es | l | 11.2 MB | 11.1 GB | 1.0 |
+  | backprop | l | 11.2 MB | 11.4 GB | 1.0 |
+  | genetic | l | 0.8 MB | 1.1 GB | 1.4 |
+  | w1_58a4 | xs | 0.8 MB | 9.0 GB | 11.2 |
+  | dfa | l | 4.0 MB | 51.0 GB | 12.8 |
+
+  A 25x spread, and the two most expensive rows are among the *smallest* files. The reason is that
+  Verilog bytes are not netlist size: a wide popcount is a couple of compact lines that elaborate
+  into an enormous adder network. dfa's readout sums `readout/n_classes` = 9,000 bits per class at
+  the `l` tier, and the quantized references sum a full integer MAC per output — both cost orders of
+  magnitude more RAM than their file size suggests, while forest's many small independent trees cost
+  less. Size `--mem` against the *elaborated* design (how wide are the popcounts, how many gate
+  instances before optimisation), never against the byte count, and leave a large margin: both time
+  and memory grow faster than linearly in the gate count.
 * **24 GB GPU ceiling.** The biggest logic nets may not fit a single 3090 in training; cap such a
   method at the largest size that fits and note it — the *union* of methods still spans the range.
 * **Quantized references** sit at the high-gate end and do not reach ~1k gates (an arithmetic
