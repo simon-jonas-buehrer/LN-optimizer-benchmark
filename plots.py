@@ -29,10 +29,24 @@ INK, INK2, MUTED, SURFACE = "#0b0b0b", "#52514e", "#b9b8b4", "#fcfcfb"
 def load(dataset: str) -> dict[str, list[dict]]:
     """method -> list of points, averaged over seeds (by point name)."""
     by_method: dict[str, dict[str, list]] = defaultdict(lambda: defaultdict(list))
+    degenerate = []
     for jf in sorted((RESULTS / dataset).glob("*/*.json")):
         p = json.loads(jf.read_text())
         if "gates" in p and "test_acc" in p:
+            # A model that never learned emits a CONSTANT circuit, which optimises away to nothing.
+            # It is a real measurement, but it is not a point on a size-vs-accuracy curve, and it
+            # cannot be allowed into these figures: both axes are log-scaled, `_frontier` KEEPS such
+            # a point (zero gates dominates everything on the size axis), and the power-law fit runs
+            # np.polyfit(np.log(gates), ...) -- so one of them silently turns a method's whole
+            # extrapolation into NaN. Drop it loudly instead.
+            if p["gates"] <= 0:
+                degenerate.append(f"{p['method']}/{p['name']}.s{p.get('seed', '?')}")
+                continue
             by_method[p["method"]][p["name"]].append(p)
+    if degenerate:
+        print(f"!!! {dataset}: dropped {len(degenerate)} degenerate 0-gate point(s) from the "
+              f"figures: {', '.join(degenerate)}\n    (a constant classifier -- the model did not "
+              f"learn; investigate rather than plot it)", flush=True)
     out = {}
     for method, pts in by_method.items():
         rows = []
@@ -56,7 +70,20 @@ def _frontier(points: list[dict]) -> list[dict]:
 
 
 def _powerlaw(x, y):
-    b, a = np.polyfit(np.log(x), np.log(y), 1)
+    """Log-log least squares. Returns None when the fit is not defined rather than NaN.
+
+    `load` already drops gates<=0, but y can still be non-positive (a method at exactly 100%
+    accuracy gives err=0 before the clip, a CE could be 0), and two identical x values give a
+    degenerate fit. Any of those would produce a NaN dashed curve that plots as nothing and reads
+    as "no extrapolation" rather than as a bug.
+    """
+    x, y = np.asarray(x, float), np.asarray(y, float)
+    ok = np.isfinite(x) & np.isfinite(y) & (x > 0) & (y > 0)
+    if ok.sum() < 2 or len(np.unique(x[ok])) < 2:
+        return None
+    b, a = np.polyfit(np.log(x[ok]), np.log(y[ok]), 1)
+    if not (np.isfinite(a) and np.isfinite(b)):
+        return None
     return float(np.exp(a)), float(b)
 
 
@@ -112,8 +139,9 @@ def plot_dataset(dataset: str, data: dict, extrapolate_to=2e7):
         ax.plot(ge, acc, color=c, lw=2, marker=mk, ms=8, mec=SURFACE, mew=2, zorder=3,
                 label=LABELS.get(method, method))
         err = np.clip(100 - acc, 1e-3, None)
-        if len(ps) >= 2:
-            A, b = _powerlaw(ge, err)
+        fit = _powerlaw(ge, err) if len(ps) >= 2 else None
+        if fit is not None:
+            A, b = fit
             xs = np.geomspace(ge[-1], extrapolate_to, 50)
             ax.plot(xs, 100 - A * xs**b, color=c, lw=1.6, ls=(0, (5, 3)), alpha=0.7, zorder=2)
     ax.legend(frameon=False, loc="lower right", fontsize=8, labelcolor=INK2, ncol=2)
@@ -135,8 +163,9 @@ def plot_dataset(dataset: str, data: dict, extrapolate_to=2e7):
             ce = np.array([p["test_ce"] for p in ps], float)
             ax.plot(ge, ce, color=c, lw=2, marker=mk, ms=8, mec=SURFACE, mew=2, zorder=3,
                     label=LABELS.get(method, method))
-            if len(ps) >= 2:
-                A, b = _powerlaw(ge, ce)
+            fit = _powerlaw(ge, ce) if len(ps) >= 2 else None
+            if fit is not None:
+                A, b = fit
                 xs = np.geomspace(ge[-1], extrapolate_to, 50)
                 ax.plot(xs, A * xs**b, color=c, lw=1.6, ls=(0, (5, 3)), alpha=0.7, zorder=2)
         ax.legend(frameon=False, loc="lower left", fontsize=8, labelcolor=INK2, ncol=2)
