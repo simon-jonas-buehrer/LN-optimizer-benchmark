@@ -15,8 +15,13 @@ scores) and **perplexity** = exp(CE). Optionally, when a sky130 liberty is confi
 2-input gate count, so the default pipeline needs only yosys+ABC, no PDK.
 
 Nothing a model reports about itself is used. `predict()` exists only so the harness can check that the
-python model and the emitted circuit are the same function; if they disagree on even one of 512 sampled
-images, the point is rejected.
+python model and the emitted circuit are the same function, and that check runs on the **entire test
+set** -- all 10,000 images, not a sample. Two things must hold for every one of them: the simulated
+NAND netlist's class equals `predict()`, and, for methods that expose `scores()`, `argmax(scores())`
+equals the netlist's class too (so the cross-entropy axis describes the same circuit as the accuracy
+axis). One disagreement rejects the point, and a rejected point writes no `.json`, so it cannot reach
+the figures. The check is unconditional -- it is part of every measurement rather than a test suite
+someone has to remember to run.
 
 ## The circuit contract
 
