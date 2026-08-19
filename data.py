@@ -67,8 +67,8 @@ def to_bits(pix: np.ndarray, spec: DatasetSpec) -> np.ndarray:
     is bit `k` (LSB first) of byte `p`, i.e. exactly `pix[pixel_bits*p +: pixel_bits]`."""
     if pix.shape[1] != spec.n_pixels:
         raise ValueError(f"{spec.name}: expected {spec.n_pixels} bytes/image, got {pix.shape[1]}")
-    bits = (pix[:, :, None] >> np.arange(spec.pixel_bits, dtype=np.uint8)) & 1
-    return bits.reshape(len(pix), spec.port_bits).astype(np.uint8)
+    bits = (pix[:, :, None] >> np.arange(spec.pixel_bits, dtype=np.uint8)) & np.uint8(1)
+    return bits.reshape(len(pix), spec.port_bits)   # already uint8; no extra copy
 
 
 # --- MNIST --------------------------------------------------------------------------------------
@@ -77,6 +77,24 @@ MNIST = DatasetSpec("mnist", 784, 8, 10)
 _MNIST_MIRROR = "https://ossci-datasets.s3.amazonaws.com/mnist/"
 _MNIST_FILES = ["train-images-idx3-ubyte.gz", "train-labels-idx1-ubyte.gz",
                 "t10k-images-idx3-ubyte.gz", "t10k-labels-idx1-ubyte.gz"]
+
+
+def _fetch(url: str, dest: Path) -> None:
+    """Download `url` to `dest`, unless `dest` is already there and non-empty.
+
+    Downloads to a sibling `.part` and renames only on success, so an interrupted or failed
+    fetch never leaves a truncated file that later looks like a finished one -- a bare
+    `dest.exists()` check would skip the retry forever and fail at parse time instead.
+    """
+    if dest.exists() and dest.stat().st_size > 0:
+        return
+    part = dest.with_name(dest.name + ".part")
+    print(f"downloading {dest.name} ...", flush=True)
+    urllib.request.urlretrieve(url, part)
+    if part.stat().st_size == 0:
+        part.unlink()
+        raise RuntimeError(f"{url} returned an empty file")
+    part.replace(dest)
 
 
 def _idx(path: Path) -> np.ndarray:
@@ -95,9 +113,7 @@ def _load_mnist() -> Dataset:
     d = DATA_ROOT / "mnist"
     d.mkdir(parents=True, exist_ok=True)
     for f in _MNIST_FILES:
-        if not (d / f).exists():
-            print(f"downloading {f} ...", flush=True)
-            urllib.request.urlretrieve(_MNIST_MIRROR + f, d / f)
+        _fetch(_MNIST_MIRROR + f, d / f)
     return _split(_idx(d / _MNIST_FILES[0]), _idx(d / _MNIST_FILES[1]),
                   _idx(d / _MNIST_FILES[2]), _idx(d / _MNIST_FILES[3]), spec=MNIST, val_size=6000)
 
@@ -124,9 +140,7 @@ def _load_cifar10() -> Dataset:
     inner = d / _CIFAR_INNER
     if not inner.exists():
         tar = d / "cifar-10-binary.tar.gz"
-        if not tar.exists():
-            print("downloading cifar-10-binary.tar.gz (~170 MB) ...", flush=True)
-            urllib.request.urlretrieve(_CIFAR_URL, tar)
+        _fetch(_CIFAR_URL, tar)          # ~170 MB
         with tarfile.open(tar, "r:gz") as t:
             t.extractall(d)  # noqa: S202 -- trusted, well-known archive
     tr = _cifar_bins([inner / f"data_batch_{i}.bin" for i in range(1, 6)])

@@ -34,6 +34,7 @@ import shutil
 import subprocess
 import tempfile
 import time
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 from types import ModuleType
@@ -44,7 +45,8 @@ from data import Dataset, DatasetSpec, to_bits
 
 ROOT = Path(__file__).resolve().parent
 RESULTS = ROOT / "results"
-CHECK_SAMPLES = 512
+CHECK_SAMPLES = 512   # historical floor only: run_point now cross-checks the FULL test set
+                      # (the circuit predictions it compares against are computed for test_acc anyway)
 
 # ================================================================================================
 # Synthesis (yosys + ABC). Configuration is environment-only, so the public repo carries no machine
@@ -58,6 +60,52 @@ YOSYS = (os.environ.get("MNISTBENCH_YOSYS")
          or (str(Path(_EDA) / "bin/yosys") if _EDA else None) or shutil.which("yosys") or "yosys")
 LIBERTY = os.environ.get("MNISTBENCH_LIBERTY") or (str(Path(_EDA) / _LIB_REL) if _EDA else "")
 NAND2_AREA_UM2 = 3.7536  # sky130_fd_sc_hd__nand2_1, the GE unit
+# How yosys hands the mapped netlist back: "blif" (default, ~7x smaller and streamed) or "json".
+# Both parse to a byte-identical NandNet; this only changes the writer and the reader.
+NETLIST_FMT = os.environ.get("MNISTBENCH_NETLIST", "blif")
+# Extra concurrent yosys processes for the optional sky130-GE syntheses (0 = fully serial, the old
+# behaviour; 2 = all three syntheses at once). yosys is single-threaded, so overlapping them is free
+# in CPU but costs one full yosys heap each -- hence the memory guard in `_synth_jobs`.
+SYNTH_JOBS = int(os.environ.get("MNISTBENCH_SYNTH_JOBS", "1"))
+# Measured: a 1.66 MB .sv (145,300 NAND cells) peaks at 1.66 GB of yosys RSS, i.e. ~1 GB per MB of
+# emitted Verilog. Used only to decide whether a second/third process fits, never for the result.
+SYNTH_GB_PER_SV_MB = float(os.environ.get("MNISTBENCH_SYNTH_GB_PER_MB", "1.1"))
+
+
+def _mem_budget_gb() -> float:
+    """Bytes this process may reasonably use, from the cgroup limit if there is one, else MemAvailable."""
+    for path in ("/sys/fs/cgroup/memory.max", "/sys/fs/cgroup/memory/memory.limit_in_bytes"):
+        try:
+            v = Path(path).read_text().strip()
+            if v.isdigit() and int(v) < (1 << 50):
+                return int(v) / 1e9
+        except OSError:
+            pass
+    try:
+        for line in Path("/proc/meminfo").read_text().splitlines():
+            if line.startswith("MemAvailable:"):
+                return int(line.split()[1]) / 1e6
+    except OSError:
+        pass
+    return 0.0
+
+
+def _synth_jobs(sv: Path) -> int:
+    """How many EXTRA yosys processes to keep live next to the NAND synthesis of `sv`."""
+    jobs = SYNTH_JOBS
+    if jobs <= 0:
+        return 0
+    budget = _mem_budget_gb()
+    if budget <= 0:
+        return jobs                      # unknown limit: trust the configured value
+    try:
+        est = sv.stat().st_size / 1e6 * SYNTH_GB_PER_SV_MB
+    except OSError:
+        return jobs
+    while jobs > 0 and (jobs + 1) * est > 0.75 * budget:
+        jobs -= 1
+    return jobs
+
 
 # One FAST, deliberately-imperfect script for every model (strash + one dc2 + map): the "fast area
 # optimizer". Frozen -- same effort for everyone, so it is not a leaderboard knob.
@@ -72,9 +120,10 @@ OPT = f"strash;{_RESYN2};dc2;{_RESYN2};resub,-K,8;dc2;{_RESYN2};map"  # high-eff
 
 @dataclass
 class Nand:
-    netlist: dict
+    netlist: dict | None      # parsed write_json output; None when the netlist came back as BLIF
     nand: int
     inv: int
+    net: "NandNet | None" = None   # ready-made NandNet (the BLIF path builds it while parsing)
 
     @property
     def gates(self) -> int:
@@ -83,6 +132,17 @@ class Nand:
 
 def has_liberty() -> bool:
     return bool(LIBERTY)
+
+
+class _Later:
+    """Serial stand-in for a Future: runs the call on .result() instead of in a worker thread."""
+
+    def __init__(self, fn, *a, **kw):
+        self._call = (fn, a, kw)
+
+    def result(self):
+        fn, a, kw = self._call
+        return fn(*a, **kw)
 
 
 def _run(cmds: str, cwd: str, timeout: int) -> str:
@@ -96,14 +156,23 @@ def _run(cmds: str, cwd: str, timeout: int) -> str:
     return log
 
 
-def synth_nand(sv: Path, *, script: str = FAST, top: str = "top", timeout: int = 14400) -> Nand:
-    """Map to NAND2 + INV only and return the netlist (for exact simulation) and gate counts."""
+def synth_nand(sv: Path, *, script: str = FAST, top: str = "top", timeout: int = 14400,
+               spec: DatasetSpec | None = None) -> Nand:
+    """Map to NAND2 + INV only and return the netlist (for exact simulation) and gate counts.
+
+    With `spec` given (and MNISTBENCH_NETLIST left at "blif") the netlist comes back as BLIF and is
+    parsed straight into a `NandNet`: same synthesis, same `stat`, same gate counts, byte-identical
+    `NandNet` -- but ~7x less text and no dict-of-dicts, which is what the biggest tiers need. Called
+    without `spec` it is exactly the old json path and still fills `.netlist`.
+    """
+    blif = spec is not None and NETLIST_FMT == "blif"
     with tempfile.TemporaryDirectory() as td:
-        out = Path(td) / "netlist.json"
+        out = Path(td) / ("netlist.blif" if blif else "netlist.json")
+        writer = f"write_blif {out}" if blif else f"write_json {out}"
         cmds = (f"read_verilog -sv {sv.resolve()}; synth -top {top} -flatten -noabc; opt -full; "
-                f"abc -g NAND -script +{script}; opt_clean; stat; write_json {out}")
+                f"abc -g NAND -script +{script}; opt_clean; stat; {writer}")
         log = _run(cmds, td, timeout)
-        netlist = json.loads(out.read_text())
+        netlist, net = (None, from_blif(out, spec, top)) if blif else (json.loads(out.read_text()), None)
     tail = log[log.rfind("Printing statistics"):]
     counts: dict[str, int] = {}
     for n, cell in re.findall(r"^\s+(\d+)\s+\$_(\w+)_\s*$", tail, re.M):
@@ -111,7 +180,7 @@ def synth_nand(sv: Path, *, script: str = FAST, top: str = "top", timeout: int =
     stray = set(counts) - {"NAND", "NOT"}
     if stray:
         raise RuntimeError(f"netlist is not NAND-only, found {stray}")
-    return Nand(netlist, counts.get("NAND", 0), counts.get("NOT", 0))
+    return Nand(netlist, counts.get("NAND", 0), counts.get("NOT", 0), net)
 
 
 def synth_ge(sv: Path, *, script: str = FAST, top: str = "top", timeout: int = 14400) -> tuple[float, float, int]:
@@ -153,17 +222,89 @@ class NandNet:
         return len(self.src_a)
 
 
-def from_json(nl: dict, spec: DatasetSpec, top: str = "top") -> NandNet:
-    mod = nl["modules"][top]
-    in_bits, out_bits = [], []
-    for port in mod["ports"].values():
-        (in_bits if port["direction"] == "input" else out_bits).extend(port["bits"])
+def _build_net(in_bits, out_bits, cells, spec: DatasetSpec) -> NandNet:
+    """Shared core of every netlist reader: port bits + an ORDERED list of (y, a, b) net keys.
+
+    `cells[i]` is gate i as (output net, input net, input net) -- an inverter repeats its input, the
+    way `$_NOT_` is read. Net keys may be anything hashable; "0"/"1" are the constants. Everything
+    downstream (levelisation, the per-level signal numbering, `src_a`/`src_b`) lives here, so any
+    two readers that hand over the same port bits and the same cell ORDER produce byte-identical
+    `NandNet`s by construction.
+    """
     if len(in_bits) != spec.port_bits:
         raise RuntimeError(f"top has {len(in_bits)} input bits, expected {spec.port_bits}")
     sig = {"0": CONST0, "1": CONST1, "x": CONST0, "z": CONST0}
     for i, b in enumerate(in_bits):
         sig[b] = 2 + i
     n_in = len(in_bits)
+    driver = {y: i for i, (y, _, _) in enumerate(cells)}
+    if len(driver) != len(cells):
+        raise RuntimeError("a net is driven by two gates")
+    # Iterative DFS on two flat predecessor lists (-1 = primary input / constant) instead of
+    # re-slicing the cell tuples and re-hashing the net names on every visit; a finished node is
+    # pushed back as its bitwise complement so no (node, flag) tuple is allocated per visit.
+    n_cells = len(cells)
+    pa = [driver.get(c[1], -1) for c in cells]
+    pb = [driver.get(c[2], -1) for c in cells]
+    level, state = [0] * n_cells, bytearray(n_cells)
+    for root in range(n_cells):
+        if state[root]:
+            continue
+        stack = [root]
+        while stack:
+            g = stack.pop()
+            if g < 0:                                   # post-order visit of ~g
+                g = ~g
+                x, y = pa[g], pb[g]
+                lv = level[x] + 1 if x >= 0 else 0
+                if y >= 0 and level[y] + 1 > lv:
+                    lv = level[y] + 1
+                level[g], state[g] = lv, 2
+            elif state[g] == 0:
+                state[g] = 1
+                stack.append(~g)
+                x, y = pa[g], pb[g]
+                if x >= 0 and state[x] == 0:
+                    stack.append(x)
+                if y >= 0 and state[y] == 0:
+                    stack.append(y)
+            elif state[g] == 1:
+                raise RuntimeError("combinational loop in the netlist")
+    depth = max(level) + 1 if cells else 0
+    buckets = [[] for _ in range(depth)]
+    for g, lv in enumerate(level):
+        buckets[lv].append(g)
+    offs, nxt, order = [2 + n_in], 2 + n_in, []
+    for lv in range(depth):
+        for g in buckets[lv]:
+            sig[cells[g][0]] = nxt
+            nxt += 1
+        order.extend(buckets[lv])
+        offs.append(nxt)
+
+    def sid(net):
+        if net not in sig:
+            raise RuntimeError(f"net {net!r} is read but never driven")
+        return sig[net]
+
+    # One flat level-ordered pass with a direct dict lookup per pin (instead of ~2 python calls per
+    # pin through sid()), then slice the levels out of it -- the arrays are contiguous by level.
+    base = 2 + n_in
+    try:
+        a_ids = np.fromiter((sig[cells[g][1]] for g in order), np.int64, len(order))
+        b_ids = np.fromiter((sig[cells[g][2]] for g in order), np.int64, len(order))
+    except KeyError as e:
+        raise RuntimeError(f"net {e.args[0]!r} is read but never driven") from None
+    src_a = [a_ids[offs[lv] - base:offs[lv + 1] - base] for lv in range(depth)]
+    src_b = [b_ids[offs[lv] - base:offs[lv + 1] - base] for lv in range(depth)]
+    return NandNet(n_in, nxt, src_a, src_b, offs, [sid(b) for b in out_bits])
+
+
+def from_json(nl: dict, spec: DatasetSpec, top: str = "top") -> NandNet:
+    mod = nl["modules"][top]
+    in_bits, out_bits = [], []
+    for port in mod["ports"].values():
+        (in_bits if port["direction"] == "input" else out_bits).extend(port["bits"])
     cells = []
     for name, c in mod["cells"].items():
         conn = c["connections"]
@@ -173,74 +314,202 @@ def from_json(nl: dict, spec: DatasetSpec, top: str = "top") -> NandNet:
             cells.append((conn["Y"][0], conn["A"][0], conn["A"][0]))
         else:
             raise RuntimeError(f"cell {name} is {c['type']}; must be NAND-only")
-    driver = {y: i for i, (y, _, _) in enumerate(cells)}
-    if len(driver) != len(cells):
-        raise RuntimeError("a net is driven by two gates")
-    level, state = [0] * len(cells), [0] * len(cells)
-    for root in range(len(cells)):
-        if state[root]:
-            continue
-        stack = [(root, False)]
-        while stack:
-            g, done = stack.pop()
-            if done:
-                lv = 0
-                for net in cells[g][1:]:
-                    src = driver.get(net)
-                    if src is not None:
-                        lv = max(lv, level[src] + 1)
-                level[g], state[g] = lv, 2
-            elif state[g] == 0:
-                state[g] = 1
-                stack.append((g, True))
-                for net in cells[g][1:]:
-                    src = driver.get(net)
-                    if src is not None and state[src] == 0:
-                        stack.append((src, False))
-            elif state[g] == 1:
-                raise RuntimeError("combinational loop in the netlist")
-    depth = max(level) + 1 if cells else 0
-    buckets = [[] for _ in range(depth)]
-    for g, lv in enumerate(level):
-        buckets[lv].append(g)
-    offs, nxt = [2 + n_in], 2 + n_in
-    for lv in range(depth):
-        for g in buckets[lv]:
-            sig[cells[g][0]] = nxt
-            nxt += 1
-        offs.append(nxt)
-
-    def sid(net):
-        if net not in sig:
-            raise RuntimeError(f"net {net!r} is read but never driven")
-        return sig[net]
-
-    src_a = [np.array([sid(cells[g][1]) for g in b], np.int64) for b in buckets]
-    src_b = [np.array([sid(cells[g][2]) for g in b], np.int64) for b in buckets]
-    return NandNet(n_in, nxt, src_a, src_b, offs, [sid(b) for b in out_bits])
+    return _build_net(in_bits, out_bits, cells, spec)
 
 
-def run(net: NandNet, x_bits: np.ndarray, spec: DatasetSpec, chunk: int = 4096) -> np.ndarray:
-    preds = []
-    for i in range(0, len(x_bits), chunk):
-        xb = x_bits[i:i + chunk]
-        n = len(xb)
-        pad = (-n) % WORD
-        if pad:
-            xb = np.concatenate([xb, np.zeros((pad, xb.shape[1]), np.uint8)])
-        packed = np.packbits(np.ascontiguousarray(xb.T), axis=1, bitorder="little").view(np.uint64)
-        acts = np.zeros((net.n_sig, packed.shape[1]), np.uint64)
-        acts[CONST1] = np.uint64(0xFFFFFFFFFFFFFFFF)
+_BLIF_CONST = {"$false": "0", "$true": "1", "$undef": "0"}
+
+
+def from_blif(path, spec: DatasetSpec, top: str = "top") -> NandNet:
+    """Same `NandNet` as `from_json`, read from yosys `write_blif` instead.
+
+    BLIF is ~7x smaller than the json for the same netlist and is line-oriented, so it parses
+    without ever holding the whole file (let alone a dict-of-dicts) in memory -- which is what makes
+    the biggest tiers reachable at all. yosys writes the cells in the same module order for both
+    writers, so handing `_build_net` the same port bits and the same cell order reproduces the json
+    net exactly (asserted field-by-field in the tests).
+
+    Recognised `.names` blocks, which is exactly what an all-NAND netlist can contain:
+      0 inputs, no row / row `1`       -> the constants $false / $undef, $true
+      1 input,  row `0 1` / `1 1`      -> inverter / buffer (a buffer is an alias, not a gate:
+                                          the json has no cell for it either)
+      2 inputs, rows `0- 1` and `-0 1` -> NAND
+    """
+    ids: dict = {}          # net name -> small int key; the names themselves are never kept
+
+    def nid(name):
+        i = ids.get(name)
+        if i is None:
+            i = ids[name] = len(ids)
+        return i
+
+    in_bits, out_bits, cells, alias = [], [], [], {}
+    model = None
+    pend_ins, pend_out, rows = None, None, None
+
+    def flush():
+        """Turn the finished .names block into a cell, an alias, or a constant."""
+        if pend_out is None:
+            return
+        k = len(pend_ins)
+        if k == 0:
+            v = "1" if rows == ["1"] else "0"
+            if pend_out != v:            # `.names $true` is the constant itself, not an alias of it
+                alias[pend_out] = v
+        elif k == 1:
+            if rows == ["0 1"]:
+                cells.append((pend_out, pend_ins[0], pend_ins[0]))       # inverter
+            elif rows == ["1 1"]:
+                if pend_out != pend_ins[0]:
+                    alias[pend_out] = pend_ins[0]                        # buffer: pure connection
+            else:
+                raise RuntimeError(f"blif: unsupported 1-input .names rows {rows}")
+        elif k == 2:
+            if sorted(rows) != ["-0 1", "0- 1"]:
+                raise RuntimeError(f"blif: 2-input .names is not a NAND, rows {rows}")
+            cells.append((pend_out, pend_ins[0], pend_ins[1]))
+        else:
+            raise RuntimeError(f"blif: {k}-input .names; the netlist must be NAND-only")
+
+    with open(path, "r") as f:
+        buf = ""
+        for raw in f:
+            line = raw.strip()
+            if not line or line.startswith("#"):
+                continue
+            if line.endswith("\\"):
+                buf += line[:-1] + " "
+                continue
+            line, buf = buf + line, ""
+            if line.startswith("."):
+                flush()
+                pend_ins, pend_out, rows = None, None, None
+                tok = line.split()
+                cmd = tok[0]
+                if cmd == ".model":
+                    model = tok[1] if len(tok) > 1 else None
+                elif cmd == ".inputs":
+                    in_bits.extend(nid(t) for t in tok[1:])
+                elif cmd == ".outputs":
+                    out_bits.extend(nid(t) for t in tok[1:])
+                elif cmd == ".names":
+                    pend_ins = [_BLIF_CONST.get(t) or nid(t) for t in tok[1:-1]]
+                    pend_out = _BLIF_CONST.get(tok[-1]) or nid(tok[-1])
+                    rows = []
+                elif cmd == ".end":
+                    break
+                else:
+                    raise RuntimeError(f"blif: unexpected directive {cmd}")
+            elif rows is not None:
+                rows.append(line)
+            else:
+                raise RuntimeError(f"blif: stray line {line!r}")
+        flush()
+    if model is not None and model != top:
+        raise RuntimeError(f"blif: model is {model!r}, expected {top!r}")
+
+    if alias:   # resolve buffer/constant chains with path compression, then rewrite the cell pins
+        limit = len(alias) + 1
+
+        def root(k):
+            seen = []
+            while k in alias:
+                seen.append(k)
+                k = alias[k]
+                if len(seen) > limit:
+                    raise RuntimeError("combinational loop in the netlist")
+            for s_ in seen:
+                alias[s_] = k
+            return k
+        cells = [(y, root(a), root(b)) for y, a, b in cells]
+        in_bits = [root(b) for b in in_bits]
+        out_bits = [root(b) for b in out_bits]
+    return _build_net(in_bits, out_bits, cells, spec)
+
+
+FULL64 = np.uint64(0xFFFFFFFFFFFFFFFF)
+_ACTS_BUDGET = 2 << 30   # cap the (n_sig, words) signal buffer; chunking is result-transparent
+
+
+def _fit(packed: np.ndarray, rows: int, words: int) -> np.ndarray:
+    """Zero-extend a (rows, w) packed block to exactly `words` uint64 columns."""
+    if packed.shape[1] == words:
+        return packed
+    out = np.zeros((rows, words * 8), np.uint8)
+    src = packed.view(np.uint8)
+    out[:, :src.shape[1]] = src
+    return out.view(np.uint64)
+
+
+def _pack_bits(x_bits: np.ndarray, words: int) -> np.ndarray:
+    """(n, port_bits) uint8 bits -> (port_bits, words) uint64, 64 images per word."""
+    packed = np.packbits(np.ascontiguousarray(x_bits.T), axis=1, bitorder="little")
+    return _fit(packed, x_bits.shape[1], words)
+
+
+def _pack_pix(pix: np.ndarray, spec: DatasetSpec, words: int) -> np.ndarray:
+    """(n, n_pixels) uint8 -> (port_bits, words) uint64: the same bits `to_bits` produces, packed.
+
+    Identical to `_pack_bits(to_bits(pix, spec), words)` but ~5x faster and without the (N, port_bits)
+    intermediate: the shift/mask writes the transposed layout directly, so nothing has to byte-
+    transpose a multi-MB bit array afterwards."""
+    n = len(pix)
+    pb = spec.pixel_bits
+    pt = np.ascontiguousarray(pix.T)                              # (n_pixels, n)
+    sh = np.arange(pb, dtype=np.uint8)[None, :, None]
+    b = ((pt[:, None, :] >> sh) & np.uint8(1)).reshape(spec.port_bits, n)
+    packed = np.packbits(np.ascontiguousarray(b), axis=1, bitorder="little")
+    return _fit(packed, spec.port_bits, words)
+
+
+def _words_for(net: NandNet, chunk: int, n_total: int) -> int:
+    words = max(1, (min(chunk, n_total) + WORD - 1) // WORD) if n_total else 1
+    while words > 1 and net.n_sig * words * 8 > _ACTS_BUDGET:
+        words //= 2
+    return words
+
+
+def _simulate(net: NandNet, spec: DatasetSpec, chunks, n_total: int, words: int) -> np.ndarray:
+    """Shared packed NAND simulation core. `chunks` yields (packed (port_bits, <=words), n)."""
+    acts = np.empty((net.n_sig, words), np.uint64)   # allocated once, not per chunk
+    levels = list(zip(net.src_a, net.src_b, net.offs, net.offs[1:]))
+    weights = np.arange(len(net.out_sig), dtype=np.int64)[:, None]
+    pred = np.empty(n_total, np.int64)
+    pos = 0
+    for packed, n in chunks:
+        acts[CONST0] = 0
+        acts[CONST1] = FULL64
         acts[2:2 + net.n_in] = packed
-        for lv, (a, b) in enumerate(zip(net.src_a, net.src_b)):
-            acts[net.offs[lv]:net.offs[lv + 1]] = ~(acts[a] & acts[b])
+        for a, b, o0, o1 in levels:
+            t = acts[o0:o1]                          # write the NAND straight into its own rows
+            np.bitwise_and(acts[a], acts[b], out=t)
+            np.invert(t, out=t)
         out = np.unpackbits(acts[net.out_sig].view(np.uint8), axis=1, bitorder="little")
-        cls = (out.astype(np.int64) << np.arange(len(net.out_sig), dtype=np.int64)[:, None]).sum(0)
-        preds.append(cls[:n])
-    pred = np.concatenate(preds)
+        cls = (out.astype(np.int64) << weights).sum(0)
+        pred[pos:pos + n] = cls[:n]
+        pos += n
     if (pred >= spec.n_classes).any():
         raise RuntimeError(f"circuit produced class >= {spec.n_classes} -- argmax broken")
     return pred
+
+
+def run(net: NandNet, x_bits: np.ndarray, spec: DatasetSpec, chunk: int = 4096) -> np.ndarray:
+    n_total = len(x_bits)
+    words = _words_for(net, chunk, n_total)
+    step = words * WORD
+    chunks = ((_pack_bits(x_bits[i:i + step], words), len(x_bits[i:i + step]))
+              for i in range(0, n_total, step))
+    return _simulate(net, spec, chunks, n_total, words)
+
+
+def run_pix(net: NandNet, pix: np.ndarray, spec: DatasetSpec, chunk: int = 4096) -> np.ndarray:
+    """`run(net, to_bits(pix, spec), spec)` without ever materialising the bit array (same result)."""
+    n_total = len(pix)
+    words = _words_for(net, chunk, n_total)
+    step = words * WORD
+    chunks = ((_pack_pix(pix[i:i + step], spec, words), len(pix[i:i + step]))
+              for i in range(0, n_total, step))
+    return _simulate(net, spec, chunks, n_total, words)
 
 
 # ================================================================================================
@@ -280,24 +549,57 @@ def _stem(method: str, dataset: str, point: str, seed: int) -> Path:
     return d / f"{point}.s{seed}"
 
 
-def measure(sv: Path, data: Dataset) -> tuple[dict, NandNet]:
+def measure_full(sv: Path, data: Dataset) -> tuple[dict, NandNet, np.ndarray]:
+    """`measure` plus the circuit's predictions over the whole test set (they are computed
+    for `test_acc` anyway, and `run_point` cross-checks the model against every one of them)."""
     spec = data.spec
+    # yosys is single-threaded, so the (optional) sky130-GE runs -- which are independent full
+    # syntheses of the same .sv -- overlap with the NAND synthesis + simulation instead of following
+    # it. Same processes, same scripts, same numbers; only the wall clock changes. MNISTBENCH_SYNTH_
+    # JOBS caps how many extra yosys processes may be live (default 1, i.e. 2 in total; 2 overlaps
+    # all three, measured 2.6x); `_synth_jobs` drops back to serial when the .sv is big enough that
+    # the extra yosys heaps would not fit.
+    pool, ge_jobs = None, []
+    if has_liberty():
+        jobs = _synth_jobs(sv)
+        if jobs > 0:
+            pool = ThreadPoolExecutor(max_workers=jobs)
+            submit = pool.submit
+        else:
+            submit = _Later                       # serial fallback, run on .result()
+        ge_jobs = [submit(synth_ge, sv, script=FAST), submit(synth_ge, sv, script=GE_MAP)]
+    try:
+        return _measure(sv, data, spec, ge_jobs)
+    finally:
+        if pool is not None:
+            pool.shutdown(wait=False, cancel_futures=True)
+
+
+def measure(sv: Path, data: Dataset) -> tuple[dict, NandNet]:
+    m, net, _ = measure_full(sv, data)
+    return m, net
+
+
+def _measure(sv: Path, data: Dataset, spec: DatasetSpec,
+             ge_jobs: list) -> tuple[dict, NandNet, np.ndarray]:
     t0 = time.time()
-    nand = synth_nand(sv, script=FAST)
-    net = from_json(nand.netlist, spec)
+    nand = synth_nand(sv, script=FAST, spec=spec)
+    net = nand.net if nand.net is not None else from_json(nand.netlist, spec)
+    nand.netlist = nand.net = None   # free the netlist objects before the simulator allocates
     print(f"[gates] {nand.gates:,} 2-input gates ({nand.nand:,} NAND + {nand.inv:,} INV), "
           f"depth {net.depth}, {time.time() - t0:.0f}s", flush=True)
     t0 = time.time()
-    acc = float((run(net, to_bits(data.test_x, spec), spec) == data.test_y).mean()) * 100
+    pred = run_pix(net, data.test_x, spec)          # the circuit's decision per test image
+    acc = float((pred == data.test_y).mean()) * 100
     print(f"[sim  ] test acc {acc:.2f}%  ({time.time() - t0:.0f}s)", flush=True)
     m = {"gates": nand.gates, "nand": nand.nand, "inv": nand.inv, "depth": net.depth,
          "test_acc": round(acc, 2)}
-    if has_liberty():
+    if ge_jobs:
         try:
             # sky130 gate-equivalents, mapped WITHOUT and WITH ABC's dc2 optimisation. The ratio is
             # the "compressibility after training": how much ABC still removes per method.
-            ge_post, area_post, cells_post = synth_ge(sv, script=FAST)     # after ABC
-            ge_pre, area_pre, cells_pre = synth_ge(sv, script=GE_MAP)      # before ABC (map only)
+            ge_post, area_post, cells_post = ge_jobs[0].result()           # after ABC
+            ge_pre, area_pre, cells_pre = ge_jobs[1].result()              # before ABC (map only)
             ratio = round(ge_pre / max(ge_post, 1e-9), 3)
             m |= {"ge": round(ge_post, 1), "area_um2": round(area_post, 1), "cells": cells_post,
                   "ge_pre_abc": round(ge_pre, 1), "ge_post_abc": round(ge_post, 1),
@@ -307,11 +609,38 @@ def measure(sv: Path, data: Dataset) -> tuple[dict, NandNet]:
                   f"({ratio:.2f}x, {cells_post:,} cells)", flush=True)
         except RuntimeError as e:
             print(f"[ge   ] skipped ({e})", flush=True)
-    return m, net
+    return m, net, pred
 
 
 def run_point(mod: ModuleType, point: dict, data: Dataset, *, device: str, seed: int,
               gpus: int = 1) -> dict:
+    """Train one point, emit it, synthesize it, and measure the SYNTHESIZED CIRCUIT.
+
+    The reported (gates, accuracy, loss) triple has to be one real operating point of the emitted
+    ASIC, so every axis is tied back to the netlist:
+
+      * `gates`/`depth` come from the netlist itself;
+      * `test_acc` is the netlist simulated over the whole test set -- it is the hardware number,
+        never the model's;
+      * `predict()` is checked against that circuit on EVERY test image (not a sample), so `val_acc`
+        -- which has no netlist to run against, the val split being the model's own -- is produced
+        by a function proven equal to the hardware on all 10,000 test images;
+      * `argmax(scores())` is checked against the same circuit predictions, which is what ties the
+        CE / perplexity axis to the emitted hardware rather than to the trainer.
+
+    How a method gets there is its own business: training may use a soft/relaxed net and evaluate
+    the hardened one -- that gap is by design and is not checked here. The only pairing that must
+    hold exactly is eval <-> emitted circuit.
+
+    RESIDUAL LIMITATION, on purpose: the netlist's only output is the class index (`cls`), so the
+    harness can validate the ARGMAX of `scores()` against hardware but never the magnitudes of the
+    scores. `test_ce` / `test_ppl` therefore rest on `scores()` being the circuit's readout by
+    CONSTRUCTION -- `methods.lut.lut_sim` mirroring `hw.emit_lutnet` for the logic nets, the exact
+    integer forward for the quantized MLPs, `_score_int` for forest. Small float differences in
+    those magnitudes are fine; a structural divergence would not be caught here, only its effect on
+    the argmax would. Emitting the readout counts from the circuit would fix that and is deliberately
+    NOT done: it would change the design and the gate count, which is the headline measurement.
+    """
     spec = data.spec
     cfg = {k: v for k, v in point.items() if k != "name"}
     print(f"\n=== {spec.name}/{mod.__name__.split('.')[-1]}/{point['name']}  {cfg}  seed={seed}",
@@ -337,22 +666,39 @@ def run_point(mod: ModuleType, point: dict, data: Dataset, *, device: str, seed:
     sv.write_text(model.emit_verilog())
     print(f"[emit ] {sv.name}, {sv.stat().st_size / 1e6:.1f} MB", flush=True)
 
-    m, net = measure(sv, data)
+    m, net, hw = measure_full(sv, data)          # hw: the circuit's class per test image
+    scores = getattr(model, "scores", lambda _p: None)
+    n_test = len(hw)
 
-    hw = run(net, to_bits(data.test_x[:CHECK_SAMPLES], spec), spec)
-    py = np.asarray(model.predict(data.test_x[:CHECK_SAMPLES]))
+    # Every test image, not a sample of them. The test-set calls are kept adjacent so a model that
+    # memoises its forward (LutModel._counts, the quant cache) serves predict+scores from one pass.
+    t0 = time.time()
+    py = np.asarray(model.predict(data.test_x))
     if not (hw == py).all():
         bad = np.flatnonzero(hw != py)
-        raise SystemExit(f"REJECTED: circuit != model on {len(bad)}/{CHECK_SAMPLES} images "
+        raise SystemExit(f"REJECTED: circuit != model on {len(bad)}/{n_test} test images "
                          f"(e.g. {bad[:5].tolist()}). emit_verilog must equal predict.")
+    sc_te = scores(data.test_x)
+    if sc_te is not None:
+        # argmax only -- the circuit reports a class, not counts, so magnitudes are unverifiable
+        # here (see the docstring). Both sides break ties toward the lowest class, as the emitted
+        # argmax does, so an equal-score tie is not a mismatch.
+        sa = np.asarray(sc_te, float).argmax(1)
+        if not (sa == hw).all():
+            bad = np.flatnonzero(sa != hw)
+            raise SystemExit(f"REJECTED: argmax(scores) != circuit on {len(bad)}/{n_test} test "
+                             f"images (e.g. {bad[:5].tolist()}). the CE axis must describe the same "
+                             f"circuit as the accuracy axis.")
+    print(f"[check] model == circuit on all {n_test:,} test images"
+          f"{'' if sc_te is None else ' (predict and argmax(scores))'}  "
+          f"({time.time() - t0:.0f}s)", flush=True)
 
     val_acc = float((np.asarray(model.predict(data.val_x)) == data.val_y).mean()) * 100
+    sc_va = scores(data.val_x)
     out = {"name": point["name"], "method": mod.__name__.split(".")[-1], "dataset": spec.name,
            "seed": seed, "config": cfg, **m, "val_acc": round(val_acc, 2),
            "train_s": round(train_s, 1), "train_wall_s": round(train_wall_s, 1), "device": device}
 
-    scores = getattr(model, "scores", lambda _p: None)
-    sc_va, sc_te = scores(data.val_x), scores(data.test_x)
     if sc_te is not None:
         t = _fit_temperature(np.asarray(sc_va, float), data.val_y)
         ce = _cross_entropy(np.asarray(sc_te, float) / t, data.test_y)

@@ -23,16 +23,24 @@ sin-binarized (hard = 1[sin(z)>0]); residual init (tt 0b1100, pass input A) at +
 and the gradient can move. The forward is exact boolean, so the trained (thresholds, layers) go
 straight to LutModel and predict() == the emitted netlist by construction.
 
-Implementation notes (pure plumbing -- the maths above is untouched):
-  * the whole forward runs in uint8: a gate is `(tt >> p) & 1` on a per-gate 4-bit packed truth
-    table, so no (w, B) int64 temporary is ever built for the evaluation itself;
-  * the signal plane and the per-layer pattern planes are allocated once per batch shape and reused
-    (`_Plane`), and the patterns computed by the forward are handed to the gradient instead of being
-    recomputed;
-  * every source-index vector that happens to be an arithmetic progression -- which is *every* body
-    layer's `a` tap, since the butterfly reads j from the layer right below -- degenerates to a
-    strided view of the signal plane instead of a gather;
-  * error/loss stay on the device: one host sync per epoch, not one per micro-batch.
+Implementation notes -- pure plumbing. The maths above is untouched and the trained tables come out
+bit-identical to the straightforward transcription this replaced:
+
+  * DFA has no backward sweep, so the body layers never interact: their latents, feedback matrices
+    and gradient accumulators are stored as ONE stacked tensor each (all body layers share `width`).
+    The per-layer feedback matmuls become one, the per-layer scatter_adds become one, Adam sees two
+    parameters instead of `layers+1`, and DDP all-reduces two buffers instead of six. Every one of
+    those ops is elementwise or row-blocked, so stacking cannot change what they compute.
+  * the active pattern p = 2a+b is built ONCE per micro-batch, as int64, and used twice: as the
+    forward's gather index into the (w, 4) table and as the gradient's scatter index. Evaluation has
+    no gradient to feed, so it stays in uint8 and reads a packed 4-bit table as `(tt >> p) & 1`.
+  * every buffer and every view is built once per batch shape and reused (`_Plane`): the hot loop is
+    nothing but `out=` kernels -- no allocation, no zero-fill, no tensor indexing.
+  * a source-index vector that is an arithmetic progression (every body layer's `a` tap) is a
+    strided view of the signal plane, not a gather; a layer that gathers both taps gathers them in
+    one `index_select`.
+  * nothing syncs to the host inside an epoch: the loss is a device tensor, read once per epoch and
+    only on the epochs that actually print it.
 """
 
 from __future__ import annotations
@@ -98,8 +106,8 @@ def _tap(idx: torch.Tensor):
     """A source vector that is an arithmetic progression is a strided VIEW, not a gather.
 
     `acts[slice]` costs nothing; `acts[index_tensor]` copies (w, B) bytes. Every body layer's `a`
-    tap is `j + base` (step 1) and the encoder tap is often `2j` (step 2), so this removes roughly
-    half of the butterfly's gathers without touching which signals are read.
+    tap is `j + base` (step 1), so this drops a third of the butterfly's gathers without changing
+    which signals are read.
     """
     n = int(idx.numel())
     start = int(idx[0])
@@ -122,6 +130,19 @@ def hard_bit(z: torch.Tensor) -> torch.Tensor:
 _RES_SIGN = torch.tensor([-1.0, -1.0, 1.0, 1.0])
 _JITTER = 0.1
 
+# Working-set ceiling for ONE forward/backward's scratch (see `_Butterfly.merge`). Not a training
+# knob: the global batch, the shard protocol and the gradient are identical whatever it is set to --
+# it only decides how many of the fixed micro-batches are fused into one set of kernel launches.
+# 2 GiB keeps the xxl tier at its original 8-image micro-batch and lets every smaller tier run the
+# whole 256-image global batch in one shot.
+_PLANE_BUDGET = 2 << 30
+
+# Capture the optimiser step as a CUDA graph when we can (see `_StepGraph`). Off => always eager.
+_USE_CUDA_GRAPH = True
+
+# Target working set of one `lut_sim` chunk's packed signal plane (see `Dfa._sim_chunk`).
+_SIM_BYTES = 32 << 20
+
 
 def _encode(pix: torch.Tensor, thresholds) -> torch.Tensor:
     """(N, n_pixels) uint8 -> (n_in, N) uint8, byte-major bit p*k+j, matching hw.emit_thermometer."""
@@ -131,22 +152,70 @@ def _encode(pix: torch.Tensor, thresholds) -> torch.Tensor:
 
 
 class _Plane:
-    """Reusable buffers for one batch width: the signal plane + each layer's active-pattern plane.
+    """Everything one batch width needs, built once and reused for the whole run.
 
-    `acts` is written end-to-end every forward (encoder rows, then one slice per layer), so it never
-    needs zeroing; `p[l]` is the (w, B) uint8 pattern the forward already computed, handed straight
-    to the gradient; `pl[l]` is its int64 twin, allocated only on the training path because
-    `scatter_add_` insists on int64 indices.
+    `acts` (n_sig, B) is the signal plane; every forward writes it end to end (encoder rows, then one
+    contiguous slice per layer), so it never needs zeroing. All the source/destination views into it
+    are fixed for the life of the plane, so `propagate` does no tensor indexing at all -- it just
+    walks a prebuilt list of `out=` kernel arguments:
+
+        steps[l] = (sel, a, b, p, out)   sel  the index_select()s this layer needs (0, 1 or 2 taps
+                                              that are real gathers -- when both are, they are
+                                              fetched by ONE index_select into a (2w, B) buffer that
+                                              `a` and `b` view)
+                                         a,b  the two source planes (strided views or gather buffers)
+                                         p    the (w, B) active pattern: int64 on a training plane,
+                                              where it doubles as the gradient's scatter index; uint8
+                                              on an eval plane, which has no gradient to feed
+                                         out  this layer's slice of `acts`
+
+    A training plane also carries the stacked body pattern `pb` (each body layer's `p` is a view into
+    it, so one scatter_add covers them all), the readout pattern reshaped by class, and the float
+    scratch for votes / error / stacked feedback delta.
     """
 
-    __slots__ = ("acts", "p", "pl")
+    __slots__ = ("acts", "enc", "read", "steps", "grad", "pb", "pr3", "vot", "e", "etau",
+                 "etau3", "db")
 
     def __init__(self, net: "_Butterfly", B: int, grad: bool) -> None:
-        dev = net.device
+        dev, nb, bw, nc = net.device, net.nb, net.bw, net.spec.n_classes
+        self.grad = grad
         self.acts = torch.empty((net.n_sig, B), dtype=torch.uint8, device=dev)
-        self.p = [torch.empty((w, B), dtype=torch.uint8, device=dev) for w in net.widths]
-        self.pl = ([torch.empty((w, B), dtype=torch.int64, device=dev) for w in net.widths]
-                   if grad else None)
+        self.enc = self.acts[: net.n_in]
+        self.read = self.acts[net.offs[-2] : net.offs[-1]].view(nc, net.rg, B)
+
+        # the active patterns: body layers stacked (one scatter_add for all of them), readout apart
+        dt = torch.int64 if grad else torch.uint8
+        self.pb = torch.empty((nb * bw, B), dtype=dt, device=dev)
+        pr = torch.empty((net.widths[-1], B), dtype=dt, device=dev)
+        self.pr3 = pr.view(nc, net.rg, B) if grad else None
+        ps = [self.pb[l * bw : (l + 1) * bw] for l in range(nb)] + [pr]
+
+        self.steps = []
+        for l, ((ta, tb), w) in enumerate(zip(net.taps, net.widths)):
+            va, vb = isinstance(ta, slice), isinstance(tb, slice)
+            if va and vb:
+                sel, a, b = (), self.acts[ta], self.acts[tb]
+            elif va:
+                gb = torch.empty((w, B), dtype=torch.uint8, device=dev)
+                sel, a, b = ((tb, gb),), self.acts[ta], gb
+            elif vb:
+                ga = torch.empty((w, B), dtype=torch.uint8, device=dev)
+                sel, a, b = ((ta, ga),), ga, self.acts[tb]
+            else:   # both taps are gathers: fetch them with a single index_select
+                gab = torch.empty((2 * w, B), dtype=torch.uint8, device=dev)
+                sel, a, b = ((torch.cat([ta, tb]), gab),), gab[:w], gab[w:]
+            self.steps.append((sel, a, b, ps[l], self.acts[net.offs[l] : net.offs[l + 1]]))
+
+        # float scratch (training only): votes/logits, the error, and the stacked feedback delta
+        if grad:
+            self.vot = torch.empty((nc, B), device=dev)
+            self.e = torch.empty((nc, B), device=dev)
+            self.etau = torch.empty((nc, B), device=dev)
+            self.etau3 = self.etau.unsqueeze(1).expand(nc, net.rg, B)   # stride 0: never materialised
+            self.db = torch.empty((nb * bw, B), device=dev)
+        else:
+            self.vot = self.e = self.etau = self.etau3 = self.db = None
 
 
 class _Butterfly:
@@ -162,39 +231,43 @@ class _Butterfly:
         self.n_in = spec.n_pixels * bits
         self.device = device
         self.widths = [width] * layers + [readout]
+        self.nb, self.bw = layers, width          # body layers, all one width -> stackable
         self.tau = (readout // spec.n_classes) ** 0.5
-        self.rg = readout // spec.n_classes      # readout gates per class (contiguous groups)
+        self.rg = readout // spec.n_classes       # readout gates per class (contiguous groups)
 
         # fixed wiring: srcs[l] = (2, w) GLOBAL ids; layer l reads only layer l-1 (or the encoder)
         self.offs = [self.n_in]
         in_dim, in_base = self.n_in, 0
         self.srcs: list[torch.Tensor] = []
-        self.taps: list[tuple] = []
+        taps = []
         for l, w in enumerate(self.widths):
             bf = _butterfly_src(in_dim, w, l - 1).contiguous()   # (2, w) local into in_dim
             gl = bf + in_base                                    # global ids, still on the host
-            self.taps.append((_tap(gl[0]), _tap(gl[1])))
+            taps.append((_tap(gl[0]), _tap(gl[1])))
             self.srcs.append(gl.to(device))
             in_base = self.offs[-1]                              # next layer reads this layer's outs
             self.offs.append(self.offs[-1] + w)
             in_dim = w
         self.taps = [(a if isinstance(a, slice) else a.to(device),
-                      b if isinstance(b, slice) else b.to(device)) for a, b in self.taps]
+                      b if isinstance(b, slice) else b.to(device)) for a, b in taps]
 
-        # learned: the only parameters in the whole record
-        self.z = [
-            (_RES_SIGN.to(device) * (torch.pi / 4)).expand(w, 4).contiguous()
-            + torch.randn(w, 4, generator=g, device=device) * _JITTER
-            for w in self.widths
-        ]
-        # fixed random feedback: the backward "model". Never learned, never synthesized.
-        self.B = [
-            torch.randn(spec.n_classes, w, generator=g, device=device) / spec.n_classes ** 0.5
-            for w in self.widths[:-1]
-        ]
-        # the update only ever needs B_l^T (w, n_classes): delta^T = B_l^T e^T, one matmul, no copy
-        self.Bt = [b.t().contiguous() for b in self.B]
+        # learned: the only parameters in the whole record. Drawn per layer (the draw order IS the
+        # record's RNG stream), then stacked body / readout -- two tensors instead of layers+1.
+        res = _RES_SIGN.to(device) * (torch.pi / 4)
+        zs = [res.expand(w, 4).contiguous() + torch.randn(w, 4, generator=g, device=device) * _JITTER
+              for w in self.widths]
+        self.z = [torch.cat(zs[:-1], 0) if layers else zs[-1][:0], zs[-1]]
+        # fixed random feedback: the backward "model". Never learned, never synthesized. Only B^T is
+        # ever used (delta^T = B^T e^T), and only stacked, so that is what we keep.
+        Bs = [torch.randn(spec.n_classes, w, generator=g, device=device) / spec.n_classes ** 0.5
+              for w in self.widths[:-1]]
+        self.Btb = (torch.cat([b.t() for b in Bs], 0).contiguous() if layers
+                    else torch.zeros(0, spec.n_classes, device=device))
 
+        # persistent scratch for the binarizer: `_fb` holds sin(z) while the tables are built and
+        # cos(z) while the gradient is scaled -- two disjoint windows of the same step, one buffer.
+        self._fb = [torch.empty_like(z) for z in self.z]
+        self._Tb = [torch.empty(z.shape, dtype=torch.uint8, device=device) for z in self.z]
         self._p2 = torch.tensor([1, 2, 4, 8], dtype=torch.uint8, device=device)
         self._m1 = torch.tensor(-1.0, device=device)   # the onehot(y) subtraction, as one index_put_
         self._planes: dict[tuple[int, bool], _Plane] = {}
@@ -216,40 +289,86 @@ class _Butterfly:
             a = self._ar[B] = torch.arange(B, device=self.device)
         return a
 
+    def plane_bytes(self, grad: bool = True) -> int:
+        """Device bytes one `_Plane` costs PER IMAGE -- what bounds how wide a forward may be.
+
+        At the xxl tier the readout's int64 scatter index alone is 160 MB per image, which is why
+        `micro` exists; at the small tiers a plane is kilobytes and the same micro-batch wastes the
+        machine on kernel-launch latency. `merge` turns this number into the answer.
+        """
+        idx = 8 if grad else 1
+        b = self.n_sig                                     # the signal plane
+        b += (self.nb * self.bw + self.widths[-1]) * idx   # the active patterns
+        for (ta, tb), w in zip(self.taps, self.widths):    # the index_select destinations
+            b += w * ((not isinstance(ta, slice)) + (not isinstance(tb, slice)))
+        if grad:
+            b += self.nb * self.bw * 4 + 3 * self.spec.n_classes * 4   # delta^T, votes/e/e_tau
+        return b
+
+    def merge(self, micro: int, accum: int) -> int:
+        """How many of the `accum` micro-batches one forward may swallow, largest divisor first.
+
+        The accumulation loop reconstructs the same full-batch gradient however it is cut up, so the
+        cut is free to follow the memory: one forward of `micro*g` images instead of `g` forwards of
+        `micro`. `g` divides `accum`, so the effective global batch, the per-rank contiguous shard
+        and `nglobal` are all exactly what they were -- only the float summation order moves.
+        """
+        cap = max(1, _PLANE_BUDGET // max(1, self.plane_bytes() * micro))
+        return max(d for d in range(1, accum + 1) if accum % d == 0 and d <= cap)
+
+    def _split(self, body: torch.Tensor, read: torch.Tensor) -> list[torch.Tensor]:
+        bw = self.bw
+        return [body[l * bw : (l + 1) * bw] for l in range(self.nb)] + [read]
+
     def tables(self) -> list[torch.Tensor]:
-        return [hard_bit(z) for z in self.z]
+        """Per-layer (w, 4) uint8 hard tables -- two tensors' worth, sliced back into layer views.
+
+        Written into persistent buffers: this runs once per optimiser step, and on the captured path
+        it has to be allocation-free anyway.
+        """
+        for z, fb, T in zip(self.z, self._fb, self._Tb):
+            torch.sin(z.detach(), out=fb)             # detach: `out=` refuses a grad-tracking input,
+            torch.gt(fb, 0, out=T)                    # and this is hard_bit(z), never differentiated
+        return self._split(self._Tb[0], self._Tb[1])
 
     def packed(self) -> list[torch.Tensor]:
-        """Per-layer (w, 1) uint8 with bit p = T[p]: the forward's whole truth table in one byte."""
-        return [((torch.sin(z) > 0).to(torch.uint8) * self._p2).sum(1, keepdim=True,
-                                                                    dtype=torch.uint8)
-                for z in self.z]
+        """Per-layer (w, 1) uint8 with bit p = T[p]: the eval forward's whole table in one byte."""
+        self.tables()
+        p = [(T * self._p2).sum(1, keepdim=True, dtype=torch.uint8) for T in self._Tb]
+        return self._split(p[0], p[1])
 
-    def propagate(self, pl: _Plane, tt: list[torch.Tensor]) -> torch.Tensor:
-        """`pl.acts[:n_in]` is already loaded; fill the rest. Exact bits; no relaxation anywhere."""
+    def propagate(self, pl: _Plane, tab: list[torch.Tensor]) -> torch.Tensor:
+        """`pl.enc` is already loaded; fill the rest. Exact bits; no relaxation anywhere.
+
+        Two kernels per layer on a training plane (`2a+b` straight into the int64 pattern, then
+        `T.gather`), three on an eval plane (`2a+b` in uint8, then `(tt >> p) & 1` on the packed
+        table), plus one `index_select` per layer that has to gather its taps.
+        """
         acts = pl.acts
-        for l, (ta, tb) in enumerate(self.taps):
-            p = pl.p[l]
-            torch.bitwise_left_shift(acts[ta], 1, out=p)         # p = 2a + b, in {0,1,2,3}
-            torch.bitwise_or(p, acts[tb], out=p)
-            o = acts[self.offs[l] : self.offs[l + 1]]
-            torch.bitwise_right_shift(tt[l], p, out=o)           # T[p], straight into the plane
-            torch.bitwise_and(o, 1, out=o)
+        if pl.grad:
+            for T, (sel, a, b, p, o) in zip(tab, pl.steps):
+                for src, dst in sel:
+                    torch.index_select(acts, 0, src, out=dst)
+                torch.add(b, a, alpha=2, out=p)                  # p = 2a + b, in {0,1,2,3}
+                torch.gather(T, 1, p, out=o)                     # T[p], straight into the plane
+        else:
+            for T, (sel, a, b, p, o) in zip(tab, pl.steps):
+                for src, dst in sel:
+                    torch.index_select(acts, 0, src, out=dst)
+                torch.add(b, a, alpha=2, out=p)
+                torch.bitwise_right_shift(T, p, out=o)
+                torch.bitwise_and(o, 1, out=o)
         return acts
 
-    def forward(self, enc: torch.Tensor, tt: list[torch.Tensor] | None = None) -> torch.Tensor:
+    def forward(self, enc: torch.Tensor, tab: list[torch.Tensor] | None = None) -> torch.Tensor:
         """enc (n_in, B) uint8 -> acts (n_sig, B) uint8."""
         pl = self.plane(enc.shape[1])
-        pl.acts[: self.n_in].copy_(enc)
-        return self.propagate(pl, self.packed() if tt is None else tt)
+        pl.enc.copy_(enc)
+        return self.propagate(pl, self.packed() if tab is None else tab)
 
-    def votes_t(self, acts: torch.Tensor) -> torch.Tensor:
-        """(n_classes, B) float32 group popcounts -- exact (a group is < 2^24 bits)."""
-        out = acts[self.offs[-2] : self.offs[-1]]                # (R, B)
-        return out.reshape(self.spec.n_classes, -1, out.shape[1]).sum(1, dtype=torch.float32)
-
-    def votes(self, acts: torch.Tensor) -> torch.Tensor:
-        return self.votes_t(acts).T
+    def votes_t(self, pl: _Plane, out: torch.Tensor | None = None) -> torch.Tensor:
+        """(n_classes, B) float32 group popcounts -- exact (a group is far under 2^24 bits)."""
+        return torch.sum(pl.read, 1, dtype=torch.float32, out=out)
 
     def layers_np(self) -> list:
         """Extract the hard tables + fixed wiring as np.int64 (idx_a, idx_b, tt) for LutModel."""
@@ -260,6 +379,80 @@ class _Butterfly:
                         s[1].cpu().numpy().astype(np.int64),
                         tt.cpu().numpy().astype(np.int64)))
         return out
+
+
+class _StepGraph:
+    """One whole optimiser step's forward + hand-written gradient, captured as a CUDA graph.
+
+    Once the micro-batches are merged, a step is a fixed sequence of a few dozen kernels over fixed
+    buffers with fixed shapes -- which is exactly what `torch.cuda.CUDAGraph` wants. At the small
+    tiers every one of those kernels is a couple of microseconds of arithmetic behind a couple of
+    microseconds of launch, so replaying the whole step as one submission is most of the remaining
+    time. Nothing about the computation changes: the same kernels run on the same buffers.
+
+    Only the single-GPU path is captured. The gradient all-reduce sits in the middle of the step and
+    NCCL collectives inside a capture need their own stream handling, so under DDP (and on any
+    failure at all) the caller keeps the eager path.
+
+    The two things that vary between steps are device buffers the caller fills before `replay`:
+    `cols` (which images this step sees) and `nglob` (the divisor, which only shrinks on a short
+    final block -- and short blocks take the eager path anyway).
+    """
+
+    __slots__ = ("cols", "nglob", "graph", "loss")
+
+    def __init__(self, model, net, enc, y_all, Gacc, Gr3, mb: int, accum: int, device) -> None:
+        self.cols = torch.empty(mb * accum, dtype=torch.int64, device=device)
+        self.nglob = torch.empty((), dtype=torch.float32, device=device)
+        views = [self.cols[a * mb:(a + 1) * mb] for a in range(accum)]
+        ybuf = [torch.empty(mb, dtype=y_all.dtype, device=device) for _ in range(accum)]
+        net.plane(mb, True)                  # allocate the scratch outside the capture, on this
+        net.ar(mb)                           # stream, so the graph only ever records kernels
+
+        def one_step():
+            torch._foreach_zero_(Gacc)
+            tab = net.tables()               # z is frozen for the whole step
+            lt = None
+            for v, yb in zip(views, ybuf):
+                torch.index_select(y_all, 0, v, out=yb)
+                lt = model._accum_grad(net, enc, v, yb, self.nglob, Gacc, Gr3, tab, True)
+            for l, z in enumerate(net.z):    # the shared 0.5*cos(z) factor
+                torch.cos(z.detach(), out=net._fb[l])
+                net._fb[l] *= 0.5
+                torch.mul(Gacc[l], net._fb[l], out=z.grad)
+            return lt
+
+        self.cols.copy_(torch.arange(mb * accum, device=device) % max(1, y_all.shape[0]))
+        self.nglob.fill_(float(mb * accum))
+        warm = torch.cuda.Stream()
+        warm.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(warm):
+            for _ in range(3):               # the capture records a steady state, not a cold one
+                one_step()
+        torch.cuda.current_stream().wait_stream(warm)
+        self.graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(self.graph):
+            self.loss = one_step()
+
+    @staticmethod
+    def build(model, net, enc, y_all, Gacc, Gr3, mb, accum, world, device):
+        """The captured step, or None when this run must stay eager."""
+        if (world != 1 or not _USE_CUDA_GRAPH or torch.device(device).type != "cuda"
+                or y_all.shape[0] < mb * accum):
+            return None   # no full-size block will ever appear, so there is nothing to capture
+        try:
+            return _StepGraph(model, net, enc, y_all, Gacc, Gr3, mb, accum, device)
+        except Exception as e:            # capture is an optimisation, never a requirement
+            torch.cuda.synchronize(device)   # settle whatever the aborted capture left behind
+            print(f"  (cuda graph capture unavailable: {type(e).__name__}: {e}); running eager",
+                  flush=True)
+            return None
+
+    def replay(self, cols: torch.Tensor, nglobal: int) -> torch.Tensor:
+        self.cols.copy_(cols)
+        self.nglob.fill_(float(nglobal))
+        self.graph.replay()
+        return self.loss
 
 
 class Dfa(LutModel):
@@ -273,27 +466,45 @@ class Dfa(LutModel):
         # fixed global `batch` -- same protocol for every size of this method.
         self.cfg = dict(bits=bits, width=width, layers=layers, readout=readout, epochs=epochs,
                         lr=lr, batch=batch, patience=patience, micro=micro)
-        self._sim_device = None
+        self._sim_device, self._memo = None, None
 
     def _chunk(self) -> int:
         c = self.cfg
         n_sig = self.spec.n_pixels * c["bits"] + c["width"] * c["layers"] + c["readout"]
         return max(64, min(4096, 2 ** 28 // n_sig))
 
-    # ---- inference: memoized, and on the GPU when we trained on one ----------------------------
-    def _counts(self, pix: np.ndarray) -> np.ndarray:
-        """The harness asks for predict(val_x) then scores(val_x): simulate that net once, not twice.
+    def _sim_chunk(self) -> int:
+        """Images per `lut_sim` chunk: as many 64-image words as fit a ~32 MiB signal plane.
 
-        Keyed on the array's identity (a hard reference is kept so the id cannot be recycled) and its
-        shape; the counts are a pure function of (thresholds, layers, pix), which are frozen by the
-        time the harness starts measuring.
+        The stock 512 (8 words) makes the mid tiers re-pay numpy's per-chunk overhead a dozen times
+        over; measured on the `l` net, 32 words is ~20% faster than 8 and ~25% faster than 64. The
+        count is rounded DOWN to a power of two -- an odd word count is a bad row stride and gives
+        most of the win back -- and clamped to [8, 64] words, so the wide tiers keep exactly the 512
+        they already used and their (1.2 GiB at xxl) plane does not grow.
         """
-        key = (id(pix), pix.shape)
-        if getattr(self, "_cnt_key", None) == key:
-            return self._cnt_val
-        val = lut_sim(self.thresholds, self.layers, pix, self.spec, device=self._sim_device)
-        self._cnt_key, self._cnt_pix, self._cnt_val = key, pix, val
-        return val
+        c = self.cfg
+        n_sig = self.spec.n_pixels * c["bits"] + c["width"] * c["layers"] + c["readout"]
+        w = max(8, min(64, _SIM_BYTES // (8 * max(1, n_sig))))
+        return (1 << (w.bit_length() - 1)) * 64
+
+    # ---- inference ------------------------------------------------------------------------------
+    def _counts(self, pix: np.ndarray) -> np.ndarray:
+        """LutModel's exact simulation with the two knobs it does not expose: which device, and how
+        big a chunk.
+
+        `lut_sim`'s CUDA twin is bit-for-bit the numpy reference (the same 64-images-per-word integer
+        bit arithmetic), so predict()/scores() still describe exactly the emitted netlist -- it is
+        only faster, and the wide readout tiers are where the harness spends its measuring time.
+        The memo is LutModel's, restated because passing those knobs means not calling it: the
+        harness asks for predict(val_x) and then scores(val_x), one simulation, not two.
+        """
+        memo = self._memo
+        if memo is not None and memo[0] is pix and memo[1] is self.layers:
+            return memo[2]
+        out = lut_sim(self.thresholds, self.layers, pix, self.spec, chunk=self._sim_chunk(),
+                      device=self._sim_device)
+        self._memo = (pix, self.layers, out)
+        return out
 
     def train(self, data: Dataset, *, device: str = "cpu", seed: int = 0) -> None:
         # Multi-GPU is opt-in via `ddp_gpus` (set by the harness). <=1 GPU runs `_worker` inline, so
@@ -303,8 +514,8 @@ class Dfa(LutModel):
         res = ddp.launch(self._worker, getattr(self, "ddp_gpus", 1))
         self.thresholds, self.layers = res["thresholds"], res["layers"]
         self.train_seconds = res["train_seconds"]  # pure training time (no val/measure)
-        self._data = None                          # don't pin the dataset in the checkpointed model
-        # the exact packed simulator has a bit-identical CUDA twin; use it when we have a GPU
+        self._data = None                          # don't keep the dataset pinned to the model
+        # the packed simulator has a bit-identical CUDA twin; use it when we have a GPU
         if str(device) != "cpu" and torch.cuda.is_available():
             self._sim_device = device
 
@@ -326,42 +537,56 @@ class Dfa(LutModel):
         opt = torch.optim.Adam(net.z, lr=c["lr"])
         sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=c["epochs"])
 
-        # persistent scratch: the raw per-layer gradient accumulator, the 0.5*cos(z) factor, and the
-        # grad tensors Adam reads. Allocated once instead of once per optimiser step (the readout
-        # tier is 80M floats a piece).
-        Gacc = [torch.zeros(w, 4, device=device) for w in net.widths]
-        cosb = [torch.empty(w, 4, device=device) for w in net.widths]
+        # persistent scratch: the raw gradient accumulator (body stacked / readout), the 0.5*cos(z)
+        # factor, and the grad tensors Adam reads -- allocated once, not once per optimiser step (the
+        # xxl readout is 80M floats a piece).
+        Gacc = [torch.zeros_like(z.data) for z in net.z]
+        Gr3 = Gacc[1].view(self.spec.n_classes, net.rg, 4)
         for z in net.z:
             z.grad = torch.empty_like(z)
 
         n = enc_tr.shape[1]
         step, accum, _ = ddp.accum_plan(c["micro"], world, c["batch"])  # fixed global batch/size
+        gmul = net.merge(c["micro"], accum)   # ... executed as fewer, wider forwards where it fits
+        step, accum = step * gmul, accum // gmul
+        eff = step * accum
+        gstep = _StepGraph.build(self, net, enc_tr, y_tr, Gacc, Gr3, step // world, accum,
+                                 world, device)
+        if rank == 0:
+            print(f"  batch {eff} = {accum} x {step} ({step // world}/rank, "
+                  f"{net.plane_bytes() * step // world / 2**20:.0f} MiB scratch"
+                  f"{', cuda graph' if gstep else ''})", flush=True)
         best, best_z, best_ep = float("inf"), [z.detach().clone() for z in net.z], 0
         train_secs, t_all, loss_t = 0.0, time.time(), None
         loss = float("nan")
         for ep in range(c["epochs"]):
             # the loss is a print-only quantity: compute it on the epochs that print it, and nowhere
-            # else (same printed numbers, four fewer kernels on every one of the other micro-batches)
+            # else (identical printed numbers, four fewer kernels on every other micro-batch)
             want_loss = rank == 0 and (ep % 5 == 0 or ep == c["epochs"] - 1)
             perm = torch.randperm(n, generator=g, device=device)  # identical on every rank
             t0 = time.perf_counter()
-            for i in range(0, n, step * accum):
-                micros = [perm[i + a * step:i + (a + 1) * step] for a in range(accum)]
+            for i in range(0, n, eff):
+                sl = perm[i:i + eff]
+                if gstep is not None and sl.shape[0] == eff:
+                    loss_t = gstep.replay(sl, eff)   # one submission for the whole step
+                    opt.step()
+                    continue
+                micros = [sl[a * step:(a + 1) * step] for a in range(accum)]
                 micros = [m for m in micros if m.shape[0] >= world]  # deterministic across ranks
                 if not micros:
                     continue
                 nglobal = sum((m.shape[0] // world) * world for m in micros)  # global samples used
                 torch._foreach_zero_(Gacc)
-                tt = net.packed()   # z is frozen for the whole step: binarize the tables once
+                tab = net.tables()  # z is frozen for the whole step: binarize the tables once
                 for m in micros:  # accumulate the raw hand-written gradient over micro-batches
                     local = ddp.shard(m, rank, world)
-                    loss_t = self._accum_grad(net, enc_tr, local, y_tr[local], nglobal, Gacc, tt,
-                                              want_loss)
+                    loss_t = self._accum_grad(net, enc_tr, local, y_tr[local], nglobal, Gacc, Gr3,
+                                              tab, want_loss)
                 for l, z in enumerate(net.z):  # one all-reduce, then the shared 0.5*cos(z) factor
                     ddp.all_reduce_(Gacc[l])
-                    torch.cos(z, out=cosb[l])
-                    cosb[l] *= 0.5
-                    torch.mul(Gacc[l], cosb[l], out=z.grad)
+                    torch.cos(z.detach(), out=net._fb[l])
+                    net._fb[l] *= 0.5
+                    torch.mul(Gacc[l], net._fb[l], out=z.grad)
                 opt.step()
             if device != "cpu":
                 torch.cuda.synchronize(device)
@@ -373,8 +598,8 @@ class Dfa(LutModel):
             if vl < best - 1e-4:
                 best, best_ep = vl, ep
                 best_z = [z.detach().clone() for z in net.z]
-            if rank == 0 and (ep % 5 == 0 or ep == c["epochs"] - 1):
-                loss = float(loss_t) if loss_t is not None else loss   # the epoch's only host sync
+            if want_loss:
+                loss = float(loss_t) if loss_t is not None else loss   # the epoch's one host sync
                 print(f"  epoch {ep + 1:3d}/{c['epochs']}  loss {loss:.3f}  val loss {vl:.4f}  "
                       f"(best {best:.4f} @ {best_ep + 1})  "
                       f"{(ep + 1) / (time.time() - t_all):.2f} ep/s", flush=True)
@@ -390,46 +615,40 @@ class Dfa(LutModel):
 
     # ---- the DFA update ------------------------------------------------------------------------
     def _accum_grad(self, net: _Butterfly, enc_all: torch.Tensor, cols: torch.Tensor,
-                    y: torch.Tensor, nglobal: int, Gacc: list, tt: list,
+                    y: torch.Tensor, nglobal: int, Gacc: list, Gr3: torch.Tensor, tab: list,
                     want_loss: bool = True):
-        """Add one micro-batch's raw DFA gradient into `Gacc` (per layer). No graph, no .backward().
+        """Add one micro-batch's raw DFA gradient into `Gacc`. No graph, no .backward().
 
         The error is normalised by the GLOBAL sample count `nglobal`, so summing these raw `G` over
         every micro-batch AND (in the caller) all-reducing across ranks reconstructs exactly the
         single-process full-batch gradient. The caller applies the shared 0.5*cos(z) factor and steps.
 
-        Everything is carried TRANSPOSED (n_classes, B) / (w, B): that is the layout the scatter and
-        the feedback matmul want, so no transpose or contiguous copy happens on the hot path. The
-        returned loss stays a device tensor -- the caller syncs once per epoch, not once per step.
+        Everything is carried TRANSPOSED -- (n_classes, B), (w, B) -- because that is the layout the
+        scatter and the feedback matmul want, so nothing is transposed or copied on the hot path. The
+        body layers share one matmul and one scatter_add; the readout's delta is `e` broadcast over
+        each contiguous class group, an expand (stride 0), never a materialised (w, B) copy. The
+        returned loss stays a device tensor: the caller syncs once per epoch, not once per step.
         """
         B = int(cols.shape[0])
-        nc = self.spec.n_classes
         pl = net.plane(B, True)
-        torch.index_select(enc_all, 1, cols, out=pl.acts[: net.n_in])   # gather straight into place
-        acts = net.propagate(pl, tt)
+        torch.index_select(enc_all, 1, cols, out=pl.enc)        # gather the images straight in place
+        net.propagate(pl, tab)
 
         # the ONLY global quantity: the output error, broadcast from here to every layer at once
-        logits = net.votes_t(acts) / net.tau                    # (n_classes, B)
-        prob = torch.softmax(logits, 0)
-        ar = net.ar(B)
-        loss = -torch.log(prob[y, ar] + 1e-12).mean() if want_loss else None
-        e = prob.clone()
-        e.index_put_((y, ar), net._m1, accumulate=True)          # e = prob - onehot(y)
+        e, ar = pl.e, net.ar(B)
+        torch.div(net.votes_t(pl, out=pl.vot), net.tau, out=pl.vot)          # logits (n_classes, B)
+        torch.softmax(pl.vot, 0, out=e)                                      # prob
+        loss = -torch.log(e[y, ar] + 1e-12).mean() if want_loss else None    # read before mutating
+        e.index_put_((y, ar), net._m1, accumulate=True)                      # e = prob - onehot(y)
         e /= nglobal                                            # mean over the GLOBAL batch
 
-        last = len(net.widths) - 1
-        for l, w in enumerate(net.widths):
-            idx = pl.pl[l]
-            idx.copy_(pl.p[l])                                  # scatter wants int64 indices
-            if l == last:
-                # readout: its own local gradient. dlogit_c/d bit_i = 1/tau for i in group c.
-                # class(i) = i // rg, so delta^T is just e^T broadcast over each contiguous group --
-                # an expand (stride 0), never a materialised (w, B) copy.
-                src = (e / net.tau).unsqueeze(1).expand(nc, net.rg, B)
-                Gacc[l].view(nc, net.rg, 4).scatter_add_(2, idx.view(nc, net.rg, B), src)
-            else:
-                # only the ACTIVE table entry of each gate gets gradient: G[i,p] += sum_b delta[b,i]
-                Gacc[l].scatter_add_(1, idx, net.Bt[l] @ e)     # (w, nc) @ (nc, B) = delta^T
+        # only the ACTIVE table entry of each gate gets gradient: G[i,p] += sum_b delta[b,i]
+        if net.nb:
+            torch.mm(net.Btb, e, out=pl.db)                     # (nb*w, nc) @ (nc, B) = delta^T
+            Gacc[0].scatter_add_(1, pl.pb, pl.db)
+        # readout: its own local gradient. dlogit_c/d bit_i = 1/tau for i in group c.
+        torch.div(e, net.tau, out=pl.etau)
+        Gr3.scatter_add_(2, pl.pr3, pl.etau3)
         return loss
 
     # ---- eval (torch forward; only used for the early-stopping loss) ---------------------------
@@ -437,13 +656,14 @@ class Dfa(LutModel):
     def _val_loss(self, net: _Butterfly, enc: torch.Tensor, y: torch.Tensor) -> float:
         ch = self._chunk()
         tot = torch.zeros((), dtype=torch.float64, device=enc.device)
-        tt = net.packed()
+        tab = net.packed()
         for i in range(0, enc.shape[1], ch):
             yb = y[i : i + ch]
             nb = int(yb.shape[0])
             pl = net.plane(nb)
-            pl.acts[: net.n_in].copy_(enc[:, i : i + ch])
-            logits = net.votes_t(net.propagate(pl, tt)) / net.tau      # (n_classes, nb)
+            pl.enc.copy_(enc[:, i : i + ch])
+            net.propagate(pl, tab)
+            logits = net.votes_t(pl) / net.tau                             # (n_classes, nb)
             logp = logits - torch.logsumexp(logits, 0, keepdim=True)
             tot += -logp[yb, net.ar(nb)].sum()
         return float(tot) / enc.shape[1]

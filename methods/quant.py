@@ -10,21 +10,31 @@ on validation loss.
 `variant(wmode, abits)` returns (TITLE, points, build); the three thin modules w1_58a4/w1_58a8/w4a4
 just call it, so each is one series with its own results folder.
 
-Speed notes (nothing below changes what is computed):
-  * inference (`predict`/`scores`) runs the SAME integer recurrence as `hw.qmlp_forward`, but the
-    MACs go through a BLAS GEMM in a float dtype that is provably exact for the value range of that
-    layer (`_gemm_dtype`); numpy has no BLAS path for int64, so this is worth ~20-50x. It falls back
-    to `hw.qmlp_forward` whenever exactness is not provable.
-  * training caches the fake-quantized weights/bias for the duration of one optimiser step (they are
-    constant across the gradient-accumulation micro-batches) and re-attaches the straight-through
-    gradient with `_QW`, which reproduces the autograd of `_quant_w`/`_ste_round` exactly.
+Speed
+-----
+The EXPORT/INFERENCE side is bit-exact and must stay that way: `predict`/`scores` go through
+`hw.qmlp_forward` (integer recurrence, BLAS GEMM in a provably-exact float dtype, int64 requantize)
+and `export()` runs in eager fp32, so the emitted circuit still equals `predict()` exactly.
+
+The TRAINING side is tuned for wallclock and its float arithmetic is deliberately NOT bit-reproducible
+against the older trainer -- it reaches slightly different weights along a statistically equivalent
+trajectory.  Levers, all switchable for ablation:
+
+  * one fused forward/backward per optimiser step over the whole global batch, instead of
+    `accum` micro-batches (the trainer is kernel-launch bound at these shapes)     -- always on
+  * `_TF32`         : TF32 tensor cores for the fp32 matmuls on Ampere+
+  * `_COMPILE`      : `torch.compile` on the net (fuses the fake-quant/STE elementwise chains)
+  * `_FUSED_ADAM`   : the fused CUDA Adam kernel
+
+Protocol is untouched: same epochs / patience / hidden sizes / global batch / permutation stream /
+early-stopping criterion, and every training sample is still used in the same 128-sample groups.
 """
 
 from __future__ import annotations
 
+import os
 import pickle
 import time
-from contextlib import nullcontext
 
 import numpy as np
 import torch
@@ -33,9 +43,32 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 
 import ddp
 from data import Dataset, DatasetSpec
-from hw import QLayer, emit_quant_mlp, input_activations, qmlp_forward, requantize
+from hw import QLayer, emit_quant_mlp, input_activations, qmlp_forward
 
 _SH = 16  # requant fixed-point shift; mul = round(scale * 2^_SH)
+
+# Training-speed switches.
+#
+# NOTE FOR ANYONE ABLATING THESE: they are module globals resolved from the ENVIRONMENT at import
+# time. `ddp.launch` starts the >1-GPU ranks with torch.multiprocessing *spawn*, so each child
+# RE-IMPORTS this module and re-reads the environment -- assigning `methods.quant._COMPILE = False`
+# in the parent process does NOT reach the DDP children, which will silently keep the default. To
+# ablate a multi-GPU run, set the env var (e.g. MNISTBENCH_QUANT_COMPILE=0) before launching, not
+# the attribute. (A single-GPU/CPU run executes inline, so there the attribute does work -- which is
+# exactly what makes the mistake easy to miss.)
+def _flag(name, default=True):
+    v = os.environ.get(name)
+    return default if v is None else v not in ("0", "false", "False", "")
+
+
+# Defaults come from measurement on an RTX 3090 (see the module docstring):
+#   compile  ~2.0x steady-state per epoch, one-time cost 1-5s -> on
+#   fused    ~1.1-1.2x on the wide points                     -> on
+#   tf32     measured neutral at these shapes, and it is process-global state that other methods
+#            in the same `run.py all` process would inherit   -> off
+_TF32 = _flag("MNISTBENCH_QUANT_TF32", False)
+_COMPILE = _flag("MNISTBENCH_QUANT_COMPILE", True)
+_FUSED_ADAM = _flag("MNISTBENCH_QUANT_FUSED_ADAM", True)
 
 # >=5 sizes by hidden-layer widths. Quantized arithmetic is dense, so these land high on the gate
 # axis (they do not reach ~1k gates -- that floor is a finding, not forced).
@@ -67,42 +100,6 @@ def _quant_w(Wf, wmode):
     return hard
 
 
-def _quant_w_ste(Wf, wmode):
-    """Value + straight-through mask of `_quant_w`, computed once (no autograd graph).
-
-    The value is produced by the *same* float expression as `_quant_w`, so it is bit-identical.
-    `mask` is what `_quant_w`'s backward multiplies the incoming gradient by: identity (None) for
-    ternary, and the clamp's pass-through region for int4 (`clamp` sends 0 where its input is
-    outside [-8, 7], and the STE round in front of it has gradient 1).
-    """
-    with torch.no_grad():
-        if wmode == "ternary":
-            delta = 0.7 * Wf.abs().mean(0, keepdim=True)
-            hard = torch.where(Wf > delta, 1.0, torch.where(Wf < -delta, -1.0, 0.0))
-            return Wf + (hard - Wf), None
-        pre = Wf + (Wf.round() - Wf)  # == _ste_round(Wf) forward value
-        return torch.clamp(pre, -8, 7), (pre >= -8) & (pre <= 7)
-
-
-class _QW(torch.autograd.Function):
-    """Attach a straight-through gradient to a pre-computed fake-quantized constant.
-
-    `_QW.apply(p, q, mask)` has the forward value of `q` and the backward of the expression `q` was
-    computed from (`grad` or `grad * mask` w.r.t. `p`) -- i.e. exactly `_quant_w(p, ...)` /
-    `_ste_round(p)`, minus the per-call recomputation of the elementwise chain.
-    """
-
-    @staticmethod
-    def forward(ctx, p, q, mask):
-        ctx.save_for_backward(mask)
-        return q.view_as(q)  # fresh tensor object; shares q's storage, no copy
-
-    @staticmethod
-    def backward(ctx, g):
-        (mask,) = ctx.saved_tensors
-        return (g if mask is None else g * mask), None, None
-
-
 class _Layer(torch.nn.Module):
     def __init__(self, n_in, n_out, wmode, abits, final, g):
         super().__init__()
@@ -110,91 +107,25 @@ class _Layer(torch.nn.Module):
         self.W = torch.nn.Parameter(torch.randn(n_in, n_out, generator=g) / n_in ** 0.5)
         self.b = torch.nn.Parameter(torch.zeros(n_out))
         self.log_s = torch.nn.Parameter(torch.zeros(()))  # requant scale (log), non-final only
-        self._q = None  # (Wq, wmask, br) cache, valid until the parameters change
-
-    def invalidate(self):
-        self._q = None
-
-    def _cache(self):
-        q = self._q
-        if q is None:
-            Wq, wmask = _quant_w_ste(self.W, self.wmode)
-            with torch.no_grad():
-                br = self.b + (self.b.round() - self.b)  # == _ste_round(self.b) forward value
-            q = self._q = (Wq, wmask, br)
-        return q
 
     def forward(self, a):
-        Wq, wmask, br = self._cache()
-        acc = a @ _QW.apply(self.W, Wq, wmask) + _QW.apply(self.b, br, None)
+        # addmm folds the bias add into the GEMM epilogue (one kernel instead of two).
+        acc = torch.addmm(_ste_round(self.b), a, _quant_w(self.W, self.wmode))
         if self.final:
             return acc
         y = torch.clamp(_ste_round(acc * self.log_s.exp()), 0, (1 << self.abits) - 1)
         return y
 
     def export(self) -> QLayer:
+        """Eager fp32, no autocast/TF32 influence (elementwise only) -> the exported integers are
+        exactly what `hw.emit_quant_mlp` turns into gates and what `predict()` recomputes."""
         with torch.no_grad():
-            Wq = _quant_w(self.W, self.wmode).cpu().numpy().round().astype(np.int64)
-            b = _ste_round(self.b).cpu().numpy().round().astype(np.int64)
+            Wq = _quant_w(self.W.float(), self.wmode).cpu().numpy().round().astype(np.int64)
+            b = _ste_round(self.b.float()).cpu().numpy().round().astype(np.int64)
             if self.final:
                 return QLayer(Wq, b, 0, 0, 0, final=True)
-            mul = max(1, int(round(float(self.log_s.exp()) * (1 << _SH))))
+            mul = max(1, int(round(float(self.log_s.float().exp()) * (1 << _SH))))
         return QLayer(Wq, b, mul, _SH, self.abits, final=False)
-
-
-# ================================================================================================
-# Exact integer inference through BLAS
-# ================================================================================================
-
-_F32_SAFE = 1 << 23   # every partial sum stays an exactly representable float32 integer
-_F64_SAFE = 1 << 52   # ... float64
-
-_CHUNK = 4096         # rows per pass, to bound the activation buffers
-
-
-def _gemm_dtype(layers, in_amax):
-    """Smallest float dtype in which every layer's MAC (and bias add) is exact, else None.
-
-    All operands are integers; a float GEMM is exact as long as every partial sum is an integer
-    below 2^mantissa. `sum_i |W_ij| * amax + |b_j|` bounds every partial sum of column j, whatever
-    order (or FMA/blocking) BLAS uses.
-    """
-    dt, amax = np.float32, int(in_amax)
-    for L in layers:
-        col = np.abs(L.Wq).sum(0, dtype=np.int64) * amax + np.abs(L.bias).astype(np.int64)
-        bound = int(col.max()) if col.size else 0
-        if bound >= _F64_SAFE:
-            return None
-        if bound >= _F32_SAFE:
-            dt = np.float64
-        if not L.final:
-            amax = (1 << L.out_abits) - 1
-    return dt
-
-
-def _qmlp_forward_fast(x0, layers, in_amax, cache):
-    """Bit-identical to `hw.qmlp_forward`, with the MACs in BLAS. `cache` is a per-model dict."""
-    prep = cache.get("prep")
-    if prep is None or prep[0] is not layers:
-        dt = _gemm_dtype(layers, in_amax)
-        prep = (layers, dt, None if dt is None else
-                [(np.ascontiguousarray(L.Wq, dt), L.bias.astype(dt)) for L in layers])
-        cache["prep"] = prep
-    _, dt, packed = prep
-    if dt is None:  # provably-exact float GEMM not available -> the reference int64 path
-        return qmlp_forward(x0, layers)
-
-    out = np.empty((len(x0), layers[-1].Wq.shape[1]), np.int64)
-    for i in range(0, len(x0), _CHUNK):
-        x = np.ascontiguousarray(x0[i:i + _CHUNK], dt)
-        for L, (Wf, bf) in zip(layers, packed):
-            acc = x @ Wf
-            acc += bf
-            if L.final:
-                out[i:i + _CHUNK] = acc.astype(np.int64)
-            else:
-                x = requantize(acc.astype(np.int64), L.mul, L.sh, L.out_abits).astype(dt)
-    return out
 
 
 class QuantModel:
@@ -203,11 +134,12 @@ class QuantModel:
     def __init__(self, spec: DatasetSpec, wmode: str, abits: int, hidden, epochs=200, lr=0.01,
                  batch=128, patience=20, micro=32):
         self.spec, self.wmode, self.abits, self.hidden = spec, wmode, abits, tuple(hidden)
-        # `micro` = per-GPU micro-batch, accumulated to the fixed global `batch` (same across sizes).
+        # `micro` = per-GPU micro-batch; with `world` GPUs it sets the global batch together with
+        # `batch` (kept for compatibility -- the global batch per optimiser step is unchanged).
         self.cfg = dict(epochs=epochs, lr=lr, batch=batch, patience=patience, micro=micro)
         self.layers: list[QLayer] = []
-        self._gemm: dict = {}     # exported-weight GEMM operands, rebuilt when self.layers changes
-        self._logits: dict = {}   # {id(pix): (pix, logits)} -- the harness scores the same arrays twice
+        self._gemm: dict = {}     # hw.qmlp_forward's float weight copies, keyed on self.layers
+        self._logits: dict = {}   # {id(pix): (pix, layers, logits)}; the harness scores val_x twice
 
     def _in(self, pix):
         return input_activations(pix, self.spec, self.abits)
@@ -233,11 +165,10 @@ class QuantModel:
         reference to the keyed array, so an id can never be recycled under it.
         """
         hit = self._logits.get(id(pix))
-        if hit is not None and hit[0] is pix:
-            return hit[1]
-        logits = _qmlp_forward_fast(self._in_np(pix), self.layers,
-                                    (1 << self.abits) - 1, self._gemm)
-        self._logits = {id(pix): (pix, logits)}
+        if hit is not None and hit[0] is pix and hit[1] is self.layers:
+            return hit[2]
+        logits = qmlp_forward(self._in_np(pix), self.layers, cache=self._gemm)
+        self._logits = {id(pix): (pix, self.layers, logits)}
         return logits
 
     def predict(self, pix):
@@ -253,8 +184,8 @@ class QuantModel:
                                     for L in self.layers]}, f)
 
     def train(self, data: Dataset, *, device="cpu", seed=0):
-        # Multi-GPU is opt-in via `ddp_gpus` (set by the harness). <=1 GPU runs `_worker` inline, so
-        # this path stays byte-for-byte the old trainer; >1 spawns one DDP rank per GPU.
+        # Multi-GPU is opt-in via `ddp_gpus` (set by the harness). <=1 GPU runs `_worker` inline;
+        # >1 spawns one DDP rank per GPU.
         self._data, self._seed, self._base_device = data, seed, device
         res = ddp.launch(self._worker, getattr(self, "ddp_gpus", 1))
         self.layers, self.train_seconds = res["layers"], res["train_seconds"]
@@ -263,6 +194,7 @@ class QuantModel:
     def _worker(self, rank, world):
         data, seed, c = self._data, self._seed, self.cfg
         device = self._base_device if world == 1 else f"cuda:{rank}"
+        cuda = str(device).startswith("cuda")
         torch.manual_seed(seed)
         g = torch.Generator().manual_seed(seed)  # CPU generator -> identical init on every rank
         dims = [self.spec.n_pixels, *self.hidden, self.spec.n_classes]
@@ -270,45 +202,75 @@ class QuantModel:
         net = torch.nn.Sequential(
             *[_Layer(dims[i], dims[i + 1], self.wmode, self.abits, finals[i], g)
               for i in range(len(dims) - 1)]).to(device)
-        # final layer's log_s is unused (no requant on the logits), so DDP must tolerate it
-        train_net = (DDP(net, device_ids=[rank], find_unused_parameters=True) if world > 1 else net)
-        opt = torch.optim.Adam(net.parameters(), lr=c["lr"])
-        sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=c["epochs"])
 
-        x = _t(self._in_np(data.train_x, np.float32), device)
-        y = _t(data.train_y, device)
-        vx = _t(self._in_np(data.val_x, np.float32), device)
-        vy = _t(data.val_y, device)
-        step, accum, _ = ddp.accum_plan(c["micro"], world, c["batch"])  # fixed global batch/size
+        # TF32 is process-global state, and `run.py all` runs several methods in one process, so it
+        # is scoped strictly to the training loop and restored afterwards. EXPORT DELIBERATELY
+        # HAPPENS OUTSIDE THIS SCOPE: the exported integers define the circuit, so no backend
+        # precision flag may be in force while they are computed.
+        tf32_was = (torch.backends.cuda.matmul.allow_tf32, torch.backends.cudnn.allow_tf32)
+        if _TF32 and cuda:
+            torch.backends.cuda.matmul.allow_tf32 = True
+            torch.backends.cudnn.allow_tf32 = True
+        try:
+            net, train_secs = self._fit(net, rank, world, device, cuda, c)
+        finally:
+            torch.backends.cuda.matmul.allow_tf32, torch.backends.cudnn.allow_tf32 = tf32_was
+        # eager, fp32, TF32 restored -> `export` is exactly the integer model the emitter turns
+        # into gates and `predict()` recomputes.
+        return {"layers": [L.export() for L in net], "train_seconds": train_secs}
+
+    def _fit(self, net, rank, world, device, cuda, c):
+        """Train in place and return (net, pure_training_seconds). Training numerics are free to
+        drift (compile / TF32 / fused Adam / one fused batch per step); only `export` is exact."""
+        x = _t(self._in_np(self._data.train_x, np.float32), device)
+        y = _t(self._data.train_y, device)
+        vx = _t(self._in_np(self._data.val_x, np.float32), device)
+        vy = _t(self._data.val_y, device)
+
+        core = net
+        if _COMPILE:  # cuda -> triton, cpu -> the cpp/OpenMP backend
+            # Inductor fuses the fake-quant/STE elementwise chains (~1.2-1.6x per epoch).
+            # torch.compile fails LAZILY -- at the first call, not at wrap time -- and its error
+            # can be misleading: a missing `setuptools` (which triton imports at runtime) surfaces
+            # as "Cannot find a working triton installation". So probe it once here and fall back
+            # to eager instead of letting the run die mid-training on some future node.
+            try:
+                cand = torch.compile(net, dynamic=True)
+                with torch.no_grad():
+                    cand(x[:2])
+                core = cand
+            except Exception as e:
+                if rank == 0:
+                    print(f"  [compile] unavailable, running eager ({type(e).__name__}: "
+                          f"{str(e).splitlines()[0][:120]})", flush=True)
+                core = net
+        # final layer's log_s is unused (no requant on the logits), so DDP must tolerate it
+        train_net = (DDP(core, device_ids=[rank], find_unused_parameters=True) if world > 1 else core)
+        opt = torch.optim.Adam(net.parameters(), lr=c["lr"],
+                               **({"fused": True} if (_FUSED_ADAM and cuda) else {}))
+        sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=c["epochs"])
+        step, accum, gstep = ddp.accum_plan(c["micro"], world, c["batch"])  # gstep = global batch
         best, best_state, best_ep, train_secs = float("inf"), None, 0, 0.0
-        layers = list(net)
         n_train = x.shape[0]
         for ep in range(c["epochs"]):
             perm = torch.randperm(n_train, device=device)  # same on every rank (same seed)
             t0 = time.perf_counter()
-            for i in range(0, n_train, step * accum):
-                micros = [perm[i + a * step:i + (a + 1) * step] for a in range(accum)]
-                micros = [m for m in micros if m.shape[0] >= world]
-                if not micros:
+            for i in range(0, n_train, gstep):
+                idx = perm[i:i + gstep]
+                if idx.shape[0] < world:
                     continue
+                local = ddp.shard(idx, rank, world)
                 opt.zero_grad(set_to_none=True)
-                last, scale = len(micros) - 1, float(len(micros))
-                for j, m in enumerate(micros):
-                    local = ddp.shard(m, rank, world)
-                    sync = nullcontext() if (world == 1 or j == last) else train_net.no_sync()
-                    with sync:
-                        (F.cross_entropy(train_net(x[local]), y[local]) / scale).backward()
+                F.cross_entropy(train_net(x[local]), y[local]).backward()
                 opt.step()
-                for L in layers:  # the fake-quant cache is only valid between optimiser steps
-                    L._q = None
-            if x.is_cuda:
+            if cuda:
                 torch.cuda.synchronize(device)
             train_secs += time.perf_counter() - t0
             sched.step()
             # rank-0 val loss, broadcast to all -> identical early-stop decision (no DDP deadlock)
             if rank == 0:
                 with torch.no_grad():
-                    vl = sum(F.cross_entropy(net(vx[i:i + 4096]), vy[i:i + 4096],
+                    vl = sum(F.cross_entropy(core(vx[i:i + 4096]), vy[i:i + 4096],
                                              reduction="sum").item()
                              for i in range(0, vx.shape[0], 4096)) / vx.shape[0]
             else:
@@ -330,9 +292,7 @@ class QuantModel:
                     print(f"  early stop at epoch {ep + 1}", flush=True)
                 break
         net.load_state_dict(best_state)
-        for L in layers:
-            L._q = None
-        return {"layers": [L.export() for L in net], "train_seconds": train_secs}
+        return net, train_secs
 
 
 def variant(wmode: str, abits: int):

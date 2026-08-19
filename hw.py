@@ -90,12 +90,18 @@ def emit_lutnet(thresholds, layers, spec: DatasetSpec, *, top: str = "top") -> s
         w = len(idx_a)
         if not (len(idx_b) == len(tt) == w):
             raise ValueError(f"layer {li}: idx_a/idx_b/tt length mismatch")
+        # one bulk conversion to python ints + one vectorised range check, instead of two int()
+        # calls and two comparisons per gate; the emitted text is byte-identical.
+        a_l = np.asarray(idx_a, np.int64).tolist()
+        b_l = np.asarray(idx_b, np.int64).tolist()
+        t_l = (np.asarray(tt, np.int64) & 0xF).tolist()
+        if w and not (0 <= min(a_l) and max(a_l) < off and 0 <= min(b_l) and max(b_l) < off):
+            for i, (a, b) in enumerate(zip(a_l, b_l)):
+                if not (0 <= a < off and 0 <= b < off):
+                    raise ValueError(f"layer {li} gate {i} reads {a}/{b}, only 0..{off - 1} exist")
         body.append(f"  // layer {li}: {w} gates, sources < {off}")
-        for i in range(w):
-            a, b = int(idx_a[i]), int(idx_b[i])
-            if not (0 <= a < off and 0 <= b < off):
-                raise ValueError(f"layer {li} gate {i} reads {a}/{b}, only 0..{off - 1} exist")
-            body.append(f"  assign s[{off + i}] = {lut2_expr(tt[i], f's[{a}]', f's[{b}]')};")
+        body.extend(f"  assign s[{off + i}] = {_LUT2[t].format(a=f's[{a}]', b=f's[{b}]')};"
+                    for i, (a, b, t) in enumerate(zip(a_l, b_l, t_l)))
         off += w
         offs.append(off)
     head = emit_popcount_argmax([f"s[{i}]" for i in range(offs[-2], offs[-1])], spec)
@@ -153,8 +159,13 @@ def requantize(acc: np.ndarray, mul: int, sh: int, out_abits: int) -> np.ndarray
     return np.clip(r, 0, (1 << out_abits) - 1)
 
 
-def qmlp_forward(x0: np.ndarray, layers: Sequence[QLayer]) -> np.ndarray:
-    """(N, in_dim0) int activations -> (N, n_classes) signed integer logits."""
+_F32_SAFE = 1 << 23     # every partial sum stays an exactly representable float32 integer (< 2^24)
+_F64_SAFE = 1 << 52     # ... float64 (< 2^53)
+_GEMM_ROWS = 4096       # rows per pass, to bound the float activation buffers
+
+
+def qmlp_forward_int(x0: np.ndarray, layers: Sequence[QLayer]) -> np.ndarray:
+    """Reference integer implementation: (N, in_dim0) int activations -> (N, n_classes) logits."""
     x, logits = x0.astype(np.int64), None
     for L in layers:
         acc = x @ L.Wq.astype(np.int64) + L.bias.astype(np.int64)
@@ -165,6 +176,69 @@ def qmlp_forward(x0: np.ndarray, layers: Sequence[QLayer]) -> np.ndarray:
     if logits is None:
         raise ValueError("no final layer")
     return logits
+
+
+def _gemm_dtype(layers: Sequence[QLayer], in_amax: int):
+    """Smallest float dtype in which every layer's MAC is exact, or None if there isn't one.
+
+    Every operand is an integer, so a float GEMM is exact as long as every partial sum is an integer
+    strictly inside the mantissa. `sum_i |W_ij| * amax + |b_j|` bounds the full column sum AND every
+    partial sum of it, whatever order (or FMA, or blocking) BLAS chooses -- so if that bound is
+    representable, the float result equals the int64 result bit for bit. `amax` is the largest
+    magnitude any activation entering that layer can have: max|x0| for the first layer, and the
+    requantize clip `2^out_abits - 1` afterwards.
+    """
+    amax = int(in_amax)
+    if amax >= _F64_SAFE:
+        return None
+    dt = np.float64 if amax >= _F32_SAFE else np.float32
+    for L in layers:
+        col = np.abs(L.Wq).sum(0, dtype=np.int64) * amax + np.abs(L.bias).astype(np.int64)
+        bound = int(col.max()) if col.size else 0
+        if bound >= _F64_SAFE:
+            return None
+        if bound >= _F32_SAFE:
+            dt = np.float64
+        if not L.final:
+            amax = (1 << L.out_abits) - 1
+    return dt
+
+
+def qmlp_forward(x0: np.ndarray, layers: Sequence[QLayer], *,
+                 cache: dict | None = None) -> np.ndarray:
+    """(N, in_dim0) int activations -> (N, n_classes) signed integer logits.
+
+    Bit-identical to `qmlp_forward_int`, but the MACs go through BLAS: numpy has no BLAS path for
+    int64 and falls back to a scalar loop, which is orders of magnitude slower on the wide layers.
+    The GEMM runs in the smallest float dtype `_gemm_dtype` can prove exact for this net (else the
+    int64 reference runs); requantization stays in int64. Pass any dict as `cache` to memoise the
+    float weight copies across calls.
+    """
+    x0 = np.asarray(x0)
+    if x0.dtype.kind not in "iub" or not layers or not layers[-1].final:
+        return qmlp_forward_int(x0, layers)
+    in_amax = int(np.abs(x0).max()) if x0.size else 0
+    prep = cache.get("_qmlp_prep") if cache is not None else None
+    if prep is None or prep[0] is not layers or prep[1] != in_amax:
+        dt = _gemm_dtype(layers, in_amax)
+        prep = (layers, in_amax, dt, None if dt is None else
+                [(np.ascontiguousarray(L.Wq, dt), L.bias.astype(dt)) for L in layers])
+        if cache is not None:
+            cache["_qmlp_prep"] = prep
+    dt, packed = prep[2], prep[3]
+    if dt is None:                       # no provably-exact float dtype -> the int64 reference
+        return qmlp_forward_int(x0, layers)
+    out = np.empty((len(x0), int(layers[-1].Wq.shape[1])), np.int64)
+    for i in range(0, len(x0), _GEMM_ROWS):
+        x = np.ascontiguousarray(x0[i:i + _GEMM_ROWS], dt)
+        for L, (Wf, bf) in zip(layers, packed):
+            acc = x @ Wf
+            acc += bf
+            if L.final:
+                out[i:i + _GEMM_ROWS] = acc.astype(np.int64)
+            else:
+                x = requantize(acc.astype(np.int64), L.mul, L.sh, L.out_abits).astype(dt)
+    return out
 
 
 def _acc_bound(L: QLayer, in_amax: int) -> int:
