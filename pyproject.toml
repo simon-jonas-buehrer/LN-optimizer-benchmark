@@ -13,5 +13,3 @@ dependencies = ["numpy>=1.24", "torch>=2.2", "matplotlib>=3.7"]
 #   conda create -n eda -c conda-forge -c litex-hub yosys open_pdks.sky130a
 # See docs/REPRODUCE.md.
 
-[tool.uv]
-package = false

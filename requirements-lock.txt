@@ -1,0 +1,40 @@
+# The environment of record: exactly what produced every number in results/.
+# Python 3.11.15, CUDA driver 535 / CUDA 12.2 (4x NVIDIA RTX 3090, 24 GB), Debian 12.
+#
+#   python3.11 -m venv .venv && . .venv/bin/activate
+#   pip install --index-url https://download.pytorch.org/whl/cu124 torch==2.6.0
+#   pip install -r requirements-lock.txt
+#
+# pyproject.toml deliberately keeps a loose `torch>=2.2` so the repo also runs on newer drivers and
+# on CPU -- but a different torch trains a numerically different net, so use this file to reproduce
+# the published numbers rather than a fresh resolve. The MEASUREMENT side (emit -> yosys/ABC ->
+# NAND simulation) is integer-exact and does not depend on the torch build at all.
+#
+# Circuit measurement (not pip-installable), see docs/REPRODUCE.md:
+#   yosys 0.68+ (git sha1 36d0660ff), conda-forge; ABC is the one bundled with it.
+#   sky130 liberty (optional, GE metric only): open_pdks.sky130a, sky130_fd_sc_hd__tt_025C_1v80.lib
+
+torch==2.6.0+cu124
+triton==3.2.0
+numpy==2.4.6
+matplotlib==3.11.1
+
+# transitive, pinned as installed
+contourpy==1.3.3
+cycler==0.12.1
+filelock==3.32.3
+fonttools==4.63.0
+fsspec==2026.7.0
+Jinja2==3.1.6
+kiwisolver==1.5.0
+MarkupSafe==3.0.3
+mpmath==1.3.0
+networkx==3.6.1
+packaging==26.3
+pillow==12.3.0
+pyparsing==3.3.2
+python-dateutil==2.9.0.post0
+setuptools==84.0.0
+six==1.17.0
+sympy==1.13.1
+typing_extensions==4.16.0

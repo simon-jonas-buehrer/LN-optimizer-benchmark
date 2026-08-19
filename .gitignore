@@ -1,12 +1,16 @@
 # cluster-specific launchers and paths -- never part of the public repo
 .local/
 
-# downloaded datasets
+# agent/editor local state
+.claude/
+
+# downloaded datasets (data.py re-fetches them on first run)
 /data/
 
 # large per-model artifacts (regenerated); the small .json metrics and the plots ARE committed
 results/**/*.sv
 results/**/*.ckpt
+results/**/*.failed.txt
 
 # python
 __pycache__/

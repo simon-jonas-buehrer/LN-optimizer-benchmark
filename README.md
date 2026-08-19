@@ -35,6 +35,9 @@ on validation loss**.
 
 ```bash
 pip install -e .                       # numpy + torch + matplotlib
+# or, for the exact environment the published numbers came from:
+#   pip install --index-url https://download.pytorch.org/whl/cu124 torch==2.6.0
+#   pip install -r requirements-lock.txt
 python run.py all --device cuda        # every method x dataset (resumable; skips finished points)
 python run.py plots                    # the four figures + results/leaderboard.md
 ```
@@ -53,6 +56,7 @@ plots.py      the four figures + leaderboard
 run.py        CLI + experiment matrix
 methods/      backprop, genetic, dfa, es, forest, w1_58a4/w1_58a8/w4a4, and lut.py (shared scaffold)
 results/<dataset>/<method>/<point>.s<seed>.{sv,ckpt,json}   circuit, checkpoint, metrics
+                                                          (only the .json is committed)
 ```
 
 Each `*.json` records accuracy, loss, perplexity, the NAND+INV 2-input gate count, and (when a liberty
