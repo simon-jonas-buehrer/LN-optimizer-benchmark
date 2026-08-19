@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import heapq
 import math
+import time
 
 import numpy as np
 
@@ -148,6 +149,7 @@ def _fit_boost(X, y, K, *, n_trees, max_leaves, min_leaf, lr, qscale, wbits,
         vscore = np.zeros((len(yv), K), np.int64)
         sum_w, best_ce, best_t = 0, float("inf"), 0
 
+    loop_t0, val_secs = time.perf_counter(), 0.0  # train_secs = whole loop minus the val evals
     for t in range(n_trees):
         yoh = np.zeros((N, K))
         yoh[np.arange(N), y] = 1.0
@@ -181,6 +183,7 @@ def _fit_boost(X, y, K, *, n_trees, max_leaves, min_leaf, lr, qscale, wbits,
         alphas.append(keep)
 
         if evalset is not None:                               # early stop on the INTEGER vote's CE
+            v0 = time.perf_counter()
             vscore[np.arange(len(yv)), tree["cls"][_route(tree, Xv)]] += keep
             sum_w += keep
             p = vscore[np.arange(len(yv)), yv] / sum_w        # = scores() of the true class
@@ -190,13 +193,15 @@ def _fit_boost(X, y, K, *, n_trees, max_leaves, min_leaf, lr, qscale, wbits,
                 best_ce, best_t = ce, len(trees)
             print(f"  tree {t:4d} | err {err:.4f} a {alpha:5.2f} -> {keep} | "
                   f"val ce {ce:.4f} acc {acc:5.2f} (best ce {best_ce:.4f} @ {best_t})", flush=True)
+            val_secs += time.perf_counter() - v0
             if len(trees) - best_t >= patience:
                 print(f"  early stop at round {t}", flush=True)
                 break
 
+    train_secs = (time.perf_counter() - loop_t0) - val_secs
     if evalset is not None:
-        return trees[:best_t], alphas[:best_t]
-    return trees, alphas
+        return trees[:best_t], alphas[:best_t], train_secs
+    return trees, alphas, train_secs
 
 
 class Forest:
@@ -270,17 +275,18 @@ class Forest:
         # pass 1: unquantized, only to see where alpha lands (nothing here is hand-tuned). A short
         # prefix is enough to size the resolution; correctness never depends on qscale.
         kw = dict(max_leaves=self.max_leaves, min_leaf=self.min_leaf, lr=self.lr, wbits=self.wbits)
-        _, a0 = _fit_boost(X, y, K, n_trees=min(self.n_trees, 50), qscale=None, **kw)
+        _, a0, ts1 = _fit_boost(X, y, K, n_trees=min(self.n_trees, 50), qscale=None, **kw)
         p95 = float(np.percentile(np.asarray(a0, float), 95)) if a0 else 1.0
         qscale = (2 ** self.wbits - 1) / max(p95, 1e-9)
         print(f"[quant] alpha p95 {p95:.3f} -> wscale {qscale:.3f} "
               f"(alpha -> int in [1, {2 ** self.wbits - 1}])", flush=True)
 
         # pass 2: the real fit, circuit integers in the loop, early stop on validation loss
-        trees, w = _fit_boost(X, y, K, n_trees=self.n_trees, qscale=qscale,
-                              evalset=(Xv, yv), patience=self.patience, **kw)
+        trees, w, ts2 = _fit_boost(X, y, K, n_trees=self.n_trees, qscale=qscale,
+                                   evalset=(Xv, yv), patience=self.patience, **kw)
         self.trees = [self._collapse(t) for t in trees]
         self.w = [int(a) for a in w]
+        self.train_seconds = ts1 + ts2  # pure boosting time (both passes), excluding val CE
         assert self.trees, "no tree survived boosting"
         assert min(self.w) >= 1, f"weights must be >= 1 (unsigned scores), got {min(self.w)}"
 

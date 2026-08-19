@@ -62,6 +62,10 @@ NAND2_AREA_UM2 = 3.7536  # sky130_fd_sc_hd__nand2_1, the GE unit
 # One FAST, deliberately-imperfect script for every model (strash + one dc2 + map): the "fast area
 # optimizer". Frozen -- same effort for everyone, so it is not a leaderboard knob.
 FAST = "strash;dc2;map"
+# Sky130 mapping with NO ABC logic optimisation (strash canonicalises, map picks cells): the
+# "before ABC" point. Compared against FAST ("after ABC", one dc2 pass) it shows how much slack ABC
+# can still squeeze out of each trained net -- i.e. which methods leave more compressible logic.
+GE_MAP = "strash;map"
 _RESYN2 = "balance;rewrite;refactor;balance;rewrite;rewrite,-z;balance;refactor,-z;rewrite,-z;balance"
 OPT = f"strash;{_RESYN2};dc2;{_RESYN2};resub,-K,8;dc2;{_RESYN2};map"  # high-effort, optional only
 
@@ -290,9 +294,17 @@ def measure(sv: Path, data: Dataset) -> tuple[dict, NandNet]:
          "test_acc": round(acc, 2)}
     if has_liberty():
         try:
-            ge, area, cells = synth_ge(sv, script=FAST)
-            m |= {"ge": round(ge, 1), "area_um2": round(area, 1), "cells": cells}
-            print(f"[ge   ] {ge:,.0f} GE ({cells:,} cells)", flush=True)
+            # sky130 gate-equivalents, mapped WITHOUT and WITH ABC's dc2 optimisation. The ratio is
+            # the "compressibility after training": how much ABC still removes per method.
+            ge_post, area_post, cells_post = synth_ge(sv, script=FAST)     # after ABC
+            ge_pre, area_pre, cells_pre = synth_ge(sv, script=GE_MAP)      # before ABC (map only)
+            ratio = round(ge_pre / max(ge_post, 1e-9), 3)
+            m |= {"ge": round(ge_post, 1), "area_um2": round(area_post, 1), "cells": cells_post,
+                  "ge_pre_abc": round(ge_pre, 1), "ge_post_abc": round(ge_post, 1),
+                  "cells_pre_abc": cells_pre, "cells_post_abc": cells_post,
+                  "ge_abc_ratio": ratio}  # >1 means ABC compressed it that many x
+            print(f"[ge   ] sky130 pre-ABC {ge_pre:,.0f} -> post-ABC {ge_post:,.0f} GE  "
+                  f"({ratio:.2f}x, {cells_post:,} cells)", flush=True)
         except RuntimeError as e:
             print(f"[ge   ] skipped ({e})", flush=True)
     return m, net
@@ -311,8 +323,11 @@ def run_point(mod: ModuleType, point: dict, data: Dataset, *, device: str, seed:
 
     t0 = time.time()
     model.train(data, device=device, seed=seed)
-    train_s = time.time() - t0
-    print(f"[train] {train_s:.0f}s", flush=True)
+    train_wall_s = time.time() - t0
+    # PURE training time: only the training compute the method measured internally (no validation, no
+    # data staging, no synth/measure). This is the axis for "how fast does each method train".
+    train_s = float(getattr(model, "train_seconds", train_wall_s))
+    print(f"[train] {train_s:.0f}s pure ({train_wall_s:.0f}s wall incl. val)", flush=True)
 
     if hasattr(model, "save"):
         model.save(str(stem) + ".ckpt")
@@ -334,7 +349,7 @@ def run_point(mod: ModuleType, point: dict, data: Dataset, *, device: str, seed:
     val_acc = float((np.asarray(model.predict(data.val_x)) == data.val_y).mean()) * 100
     out = {"name": point["name"], "method": mod.__name__.split(".")[-1], "dataset": spec.name,
            "seed": seed, "config": cfg, **m, "val_acc": round(val_acc, 2),
-           "train_s": round(train_s), "device": device}
+           "train_s": round(train_s, 1), "train_wall_s": round(train_wall_s, 1), "device": device}
 
     scores = getattr(model, "scores", lambda _p: None)
     sc_va, sc_te = scores(data.val_x), scores(data.test_x)

@@ -104,8 +104,9 @@ class Genetic(LutModel):
         counts = lambda g, x: lut_sim(thresholds, layers(g), x, spec, device=device)
 
         best_ce, best_srcs, stale = float("inf"), [s.copy() for s in srcs], 0
-        t0 = time.time()
+        t0, train_secs = time.time(), 0.0  # train_secs: only the search, never the val evals
         for gen in range(c["gens"]):
+            ts = time.perf_counter()
             idx = rng.integers(0, len(data.train_x), size=c["batch"])
             bx, by = data.train_x[idx], data.train_y[idx]
             best_fit = _margin(counts(srcs, bx), by)  # incumbent, scored on this batch
@@ -117,6 +118,7 @@ class Genetic(LutModel):
                     best_fit, winner = fit, mutant
             if winner is not None:
                 srcs = winner
+            train_secs += time.perf_counter() - ts
 
             if (gen + 1) % c["eval_every"] == 0 or gen + 1 == c["gens"]:
                 ce = _val_ce(counts(srcs, data.val_x), data.val_y)  # lut_sim chunks the val set
@@ -134,6 +136,7 @@ class Genetic(LutModel):
 
         self.thresholds = thresholds
         self.layers = layers(best_srcs)
+        self.train_seconds = train_secs
 
 
 def build(spec, **point) -> Genetic:

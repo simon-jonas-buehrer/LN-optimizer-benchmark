@@ -12,6 +12,8 @@ loss.
 
 from __future__ import annotations
 
+import time
+
 import numpy as np
 
 from data import Dataset, DatasetSpec
@@ -99,7 +101,9 @@ class ES(LutModel):
 
         best, best_theta, best_gen = float("inf"), theta.copy(), 0
         half = c["pop"] // 2
+        train_secs = 0.0  # only the ES search (fitness + update), never the val evals
         for gen in range(c["gens"]):
+            t0 = time.perf_counter()
             sel = rng.integers(0, len(data.train_x), c["batch"])
             xb, yb = data.train_x[sel], data.train_y[sel]
             seeds = rng.integers(0, 2**31, half)
@@ -114,6 +118,7 @@ class ES(LutModel):
                 eps = np.random.default_rng(s).standard_normal((G, 4)).astype(np.float32)
                 grad += (ui * sign) * eps
             theta += c["lr"] / (c["pop"] * c["sigma"]) * grad
+            train_secs += time.perf_counter() - t0
 
             if gen % c["eval_every"] == 0 or gen == c["gens"] - 1:
                 vl = self._val_loss(theta, wires, data.val_x, data.val_y, device)
@@ -127,6 +132,7 @@ class ES(LutModel):
 
         self.thresholds = thr
         self.layers = _layers(best_theta, wires, self.widths)
+        self.train_seconds = train_secs
 
 
 def build(spec, **point) -> ES:

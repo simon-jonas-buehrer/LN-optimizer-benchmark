@@ -83,6 +83,20 @@ def launch(worker, gpus: int | None):
             pass
 
 
+def accum_plan(micro: int, world: int, eff_min: int = 32):
+    """Plan gradient accumulation so a tiny per-GPU micro-batch still reaches a decent global batch.
+
+    Returns ``(step, accum, eff)`` where ``step = micro*world`` global samples flow through one
+    forward/backward (this is what bounds GPU memory, so pick ``micro`` small enough that even the
+    biggest model fits), ``accum`` micro-steps are summed before each optimiser step, and
+    ``eff = step*accum`` is the effective global batch -- always >= ``eff_min`` (32). With 4 GPUs and
+    ``micro=8`` that's already 32, so ``accum=1``; on 1 GPU (or a smaller micro) accum grows to hit 32.
+    """
+    step = micro * world
+    accum = max(1, -(-eff_min // step))  # ceil(eff_min/step)
+    return step, accum, step * accum
+
+
 def shard(idx: torch.Tensor, rank: int, world: int) -> torch.Tensor:
     """Contiguous equal-ish slice of a global minibatch's indices for this rank.
 
