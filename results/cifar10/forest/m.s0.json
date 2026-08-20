@@ -1,0 +1,34 @@
+{
+  "name": "m",
+  "method": "forest",
+  "dataset": "cifar10",
+  "seed": 0,
+  "config": {
+    "bits": 7,
+    "leaves": 128,
+    "wbits": 2,
+    "trees": 40
+  },
+  "config_effective": {
+    "trees": 40,
+    "leaves": 128,
+    "wbits": 2,
+    "bits": 7,
+    "min_leaf": 5,
+    "lr": 0.3,
+    "patience": 30
+  },
+  "gates": 40129,
+  "nand": 22155,
+  "inv": 17974,
+  "depth": 227,
+  "test_acc": 41.44,
+  "val_acc": 42.78,
+  "train_s": 290.1,
+  "train_wall_s": 291.9,
+  "train_samples": 1800000,
+  "device": "cpu",
+  "test_ce": 1.6651,
+  "test_ppl": 5.2862,
+  "ce_temp": 0.0939
+}

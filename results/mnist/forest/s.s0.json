@@ -1,0 +1,34 @@
+{
+  "name": "s",
+  "method": "forest",
+  "dataset": "mnist",
+  "seed": 0,
+  "config": {
+    "bits": 3,
+    "leaves": 128,
+    "wbits": 3,
+    "trees": 13
+  },
+  "config_effective": {
+    "trees": 13,
+    "leaves": 128,
+    "wbits": 3,
+    "bits": 3,
+    "min_leaf": 5,
+    "lr": 0.3,
+    "patience": 30
+  },
+  "gates": 11950,
+  "nand": 6935,
+  "inv": 5015,
+  "depth": 202,
+  "test_acc": 93.99,
+  "val_acc": 92.97,
+  "train_s": 109.0,
+  "train_wall_s": 109.3,
+  "train_samples": 702000,
+  "device": "cpu",
+  "test_ce": 0.2007,
+  "test_ppl": 1.2223,
+  "ce_temp": 0.0851
+}

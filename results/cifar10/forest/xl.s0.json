@@ -1,0 +1,34 @@
+{
+  "name": "xl",
+  "method": "forest",
+  "dataset": "cifar10",
+  "seed": 0,
+  "config": {
+    "bits": 7,
+    "leaves": 2048,
+    "wbits": 2,
+    "trees": 300
+  },
+  "config_effective": {
+    "trees": 300,
+    "leaves": 2048,
+    "wbits": 2,
+    "bits": 7,
+    "min_leaf": 5,
+    "lr": 0.3,
+    "patience": 30
+  },
+  "gates": 2244914,
+  "nand": 1338124,
+  "inv": 906790,
+  "depth": 345,
+  "test_acc": 50.63,
+  "val_acc": 50.52,
+  "train_s": 2672.7,
+  "train_wall_s": 2677.4,
+  "train_samples": 9765000,
+  "device": "cpu",
+  "test_ce": 1.4368,
+  "test_ppl": 4.2071,
+  "ce_temp": 0.0701
+}
