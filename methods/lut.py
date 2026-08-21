@@ -517,3 +517,22 @@ class LutModel:
                      **{f"a{i}": a for i, (a, _, _) in enumerate(self.layers)},
                      **{f"b{i}": b for i, (_, b, _) in enumerate(self.layers)},
                      **{f"t{i}": t for i, (_, _, t) in enumerate(self.layers)})
+
+
+def load(spec: DatasetSpec, path: str) -> LutModel:
+    """Rebuild the HARD model from a `.ckpt` written by `LutModel.save`.
+
+    Deliberately a plain `LutModel`, not the trainer subclass that produced it: (thresholds, layers)
+    is the entire circuit, and `emit_verilog`/`predict`/`scores` all live on the base class. The
+    synthesis job can therefore reload any of backprop/dfa/es/genetic without importing torch or
+    knowing which one wrote the file, and evaluation falls back to the numpy simulator because
+    `sim_device` is unset -- which is what a CPU-only synthesis node wants.
+    """
+    with np.load(path) as d:
+        m = LutModel(spec)
+        m.thresholds = [int(t) for t in d["thresholds"]]
+        # keys are `thresholds` plus a<i>/b<i>/t<i> per layer; count the a's (nothing else starts
+        # with "a", whereas "thresholds" would be caught by counting the t's)
+        n = sum(1 for k in d.files if k.startswith("a"))
+        m.layers = [(d[f"a{i}"], d[f"b{i}"], d[f"t{i}"]) for i in range(n)]
+    return m

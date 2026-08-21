@@ -185,8 +185,23 @@ class QuantModel:
                          "layers": [(L.Wq, L.bias, L.mul, L.sh, L.out_abits, L.final)
                                     for L in self.layers]}, f)
 
+    @classmethod
+    def load(cls, spec: DatasetSpec, path: str) -> "QuantModel":
+        """Rebuild the exported integer model from a `.ckpt` written by `save`.
+
+        The QLayer list IS the circuit -- `emit_verilog` and `predict` read nothing else -- so the
+        synthesis phase can reload and cross-check a quantized reference without retraining and
+        without a GPU. `hidden` is left empty: it only ever fed the constructor that built the
+        float net, and the ladder point that named it is recorded in the training json instead.
+        """
+        with open(path, "rb") as f:
+            d = pickle.load(f)
+        m = cls(spec, d["wmode"], d["abits"], hidden=())
+        m.layers = [QLayer(*rec) for rec in d["layers"]]
+        return m
+
     def train(self, data: Dataset, *, device="cpu", seed=0):
-        # One process, one device -- the job allocates a single RTX 3090 (or runs on CPU).
+        # One process, one device -- the job allocates a single RTX 2080 Ti (or runs on CPU).
         self._data, self._base_device = data, device
         c = self.cfg
         cuda = str(device).startswith("cuda")
@@ -286,7 +301,7 @@ class QuantModel:
 
 
 def variant(wmode: str, abits: int):
-    """Return (TITLE, points, build) for one weight/activation scheme."""
+    """Return (TITLE, points, build, load) for one weight/activation scheme."""
     wtag = "w1.58" if wmode == "ternary" else "w4"
     title = f"{wtag}a{abits} (quantized MLP reference)"
 
@@ -296,4 +311,7 @@ def variant(wmode: str, abits: int):
     def build(spec, **point):
         return QuantModel(spec, wmode, abits, **point)
 
-    return title, points, build
+    def load(spec, path):
+        return QuantModel.load(spec, path)
+
+    return title, points, build, load

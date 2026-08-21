@@ -67,7 +67,7 @@ import torch
 import batching
 from data import Dataset, DatasetSpec
 from hw import even_thresholds
-from methods.lut import LutModel
+from methods.lut import LutModel, load as lut_load
 
 TITLE = "dfa (fixed butterfly wiring, direct feedback alignment)"
 
@@ -153,8 +153,9 @@ _JITTER = 0.1
 # Working-set ceiling for ONE forward/backward's scratch (see `_Butterfly.merge`). Not a training
 # knob: the global batch, the shard protocol and the gradient are identical whatever it is set to --
 # it only decides how many of the fixed micro-batches are fused into one set of kernel launches.
-# 2 GiB keeps the xxl tier at its original 8-image micro-batch and lets every smaller tier run the
-# whole 256-image global batch in one shot.
+# 2 GiB lets every tier that fits run its whole 256-image global batch in one shot. It is a CEILING,
+# not a request: `merge` lowers it to what the card has actually got left (see `batching.budget`), so
+# the same tier simply fuses fewer micro-batches on an 11 GB 2080 Ti than on a 24 GB 3090.
 _PLANE_BUDGET = 2 << 30
 
 # Capture the optimiser step as a CUDA graph when we can (see `_StepGraph`). Off => always eager.
@@ -330,7 +331,8 @@ class _Butterfly:
         `micro`. `g` divides `accum`, so the effective global batch and `nglobal` are exactly what
         they were -- only the float summation order moves.
         """
-        cap = max(1, _PLANE_BUDGET // max(1, self.plane_bytes() * micro))
+        cap = max(1, batching.budget(_PLANE_BUDGET, device=self.device)
+                  // max(1, self.plane_bytes() * micro))
         return max(d for d in range(1, accum + 1) if accum % d == 0 and d <= cap)
 
     def _split(self, body: torch.Tensor, read: torch.Tensor) -> list[torch.Tensor]:
@@ -651,3 +653,8 @@ class Dfa(LutModel):
 
 def build(spec: DatasetSpec, **point) -> Dfa:
     return Dfa(spec, **point)
+
+
+# The synthesis phase reloads the trained circuit from its .ckpt; (thresholds, layers) is all of it,
+# so the shared LUT-net loader covers this method without touching the trainer above.
+load = lut_load

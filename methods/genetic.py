@@ -45,7 +45,7 @@ import numpy as np
 
 from data import Dataset, DatasetSpec
 from hw import even_thresholds
-from methods.lut import LutModel, pack_encoded
+from methods.lut import LutModel, load as lut_load, pack_encoded
 
 TITLE = "genetic (learned wiring, all gates NAND)"
 
@@ -262,6 +262,8 @@ class _TorchSim:
     def __init__(self, widths, offs, spec: DatasetSpec, device):
         import torch
 
+        import batching   # imported here, not at module scope: this file is numpy-only until CUDA
+
         self.torch = torch
         self.dev = torch.device(device)
         self.widths = list(widths)
@@ -272,7 +274,11 @@ class _TorchSim:
         self.g = widths[-1] // spec.n_classes
         self.last = self.n_layers - 1
         self.last_off = offs[self.last]
-        self.words = max(1, min(_MAX_WORDS_GPU, int(_SIM_MEM_GPU // (max(1, self.n_sig) * 8))))
+        # _SIM_MEM_GPU is a ceiling tuned on a 24 GB card; on a smaller one take what is actually
+        # free (see `batching.budget`), so a wide net uses more, narrower chunks instead of OOMing.
+        self.words = max(1, min(_MAX_WORDS_GPU,
+                                int(batching.budget(_SIM_MEM_GPU, device=self.dev)
+                                    // (max(1, self.n_sig) * 8))))
         self.chunk = self.words * 64
         self.mark = torch.zeros(self.n_sig, dtype=torch.uint8, device=self.dev)
         self.sh = torch.arange(64, dtype=torch.int64, device=self.dev)
@@ -543,3 +549,8 @@ class Genetic(LutModel):
 
 def build(spec, **point) -> Genetic:
     return Genetic(spec, **point)
+
+
+# The synthesis phase reloads the trained circuit from its .ckpt; (thresholds, layers) is all of it,
+# so the shared LUT-net loader covers this method without touching the trainer above.
+load = lut_load

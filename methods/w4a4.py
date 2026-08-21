@@ -1,3 +1,3 @@
 from methods.quant import variant
 
-TITLE, points, build = variant("int4", 4)
+TITLE, points, build, load = variant("int4", 4)

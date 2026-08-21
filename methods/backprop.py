@@ -18,7 +18,7 @@ import torch.nn.functional as F
 import batching
 from data import Dataset, DatasetSpec
 from hw import even_thresholds
-from methods.lut import LutModel, lut_sim
+from methods.lut import LutModel, load as lut_load, lut_sim
 
 TITLE = "backprop (learned truth tables + learned wiring)"
 
@@ -257,8 +257,9 @@ class Backprop(LutModel):
     # a GIVEN net evaluates to exactly the same logits and validation loss in either precision --
     # it only halves the bytes moved by the dominant wiring-gradient gather/reduce, at the cost of
     # 8-bit-mantissa gradients (which do, over a run, train a slightly different net).
-    # Parameters and the Adam state stay fp32 (master weights). "auto" = bf16 on CUDA, fp32 on CPU
-    # (CPU bf16 is emulated and slower). Override with MNISTBENCH_BACKPROP_ACT=fp32|bf16|auto.
+    # Parameters and the Adam state stay fp32 (master weights). "auto" = bf16 only where the card
+    # really has bfloat16 (Ampere and later), fp32 on Turing and on CPU, both of which merely
+    # emulate it. Override with MNISTBENCH_BACKPROP_ACT=fp32|bf16|auto.
     ACT = "auto"
 
     # torch.compile of _gs_kernel fuses its three passes over the (B, 2, W, cands) candidate
@@ -276,18 +277,19 @@ class Backprop(LutModel):
         return work >= self.COMPILE_MIN_WORK if want == "auto" else want not in ("0", "off")
 
     def _act(self, device):
-        want = os.environ.get("MNISTBENCH_BACKPROP_ACT", self.ACT)
-        if want == "auto":
-            want = "bf16" if torch.device(device).type == "cuda" else "fp32"
-        return {"fp32": torch.float32, "bf16": torch.bfloat16}[want]
+        return batching.act_dtype(device, os.environ.get("MNISTBENCH_BACKPROP_ACT", self.ACT))
 
-    def _budget(self):
-        """Images whose widest (2, W, cands) candidate tensor still fits the ~1 GiB working budget.
+    def _budget(self, device=None):
+        """Images whose widest (2, W, cands) candidate tensor still fits the working budget.
 
         Counted in ELEMENTS, not bytes, so a bf16 run keeps exactly the fp32 batching and simply
         occupies half the memory -- bf16 must never be the thing that makes a tier stop fitting.
+        The ceiling is 1 GiB of fp32 on a card with room for it, and `batching.budget` lowers it on
+        a card without -- an 11 GB 2080 Ti holding the xl tier's parameters, Adam state and encoded
+        dataset does not have a spare gibibyte for scratch.
         """
-        return max(1, 2 ** 28 // (2 * max(self.cfg["widths"]) * self.cfg["cands"]))
+        elems = batching.budget(2 ** 30, device=device) // 4
+        return max(1, elems // (2 * max(self.cfg["widths"]) * self.cfg["cands"]))
 
     def _chunk(self):
         """Validation batch. Under `no_grad` the layer never builds a (B, 2, W, cands) tensor any
@@ -298,7 +300,7 @@ class Backprop(LutModel):
         n_sig = self.spec.n_pixels * self.cfg["bits"] + sum(self.cfg["widths"])
         return max(64, min(2048, 2 ** 28 // (2 * n_sig)))
 
-    def _fuse(self, step, accum):
+    def _fuse(self, step, accum, device=None):
         """How many accumulation micro-steps to run in ONE forward/backward.
 
         Summing k micro-steps into a single batched forward accumulates the same gradient (only the
@@ -307,7 +309,7 @@ class Backprop(LutModel):
         of k times. Capped by the same working-set budget `_chunk` uses, so the biggest tiers keep
         their `micro`-sized footprint -- there `fuse == 1`, i.e. byte-for-byte the un-fused path.
         """
-        f = max(1, min(accum, self._budget() // step))
+        f = max(1, min(accum, self._budget(device) // step))
         cap = int(os.environ.get("MNISTBENCH_BACKPROP_FUSE", "0"))   # 0 = auto (the default)
         return f if cap <= 0 else max(1, min(f, cap))   # =1 -> the bit-exact un-fused path
 
@@ -328,7 +330,7 @@ class Backprop(LutModel):
         # fixed protocol for every size of this method: micro-batch `micro` (small, fits the widest
         # net on one card), accumulated to the method's global batch `batch` -- constant across sizes.
         step, accum, _ = batching.accum_plan(c["micro"], c["batch"])
-        fuse = self._fuse(step, accum)
+        fuse = self._fuse(step, accum, device)
         global _GS   # set explicitly every run, so one process can train several models
         work = (c["epochs"] * -(-n_train // (step * accum))        # optimiser steps
                 * (step * accum) * 2 * c["cands"] * sum(c["widths"]))   # elems per step
@@ -411,3 +413,8 @@ class Backprop(LutModel):
 
 def build(spec, **point) -> Backprop:
     return Backprop(spec, **point)
+
+
+# The synthesis phase reloads the trained circuit from its .ckpt; (thresholds, layers) is all of it,
+# so the shared LUT-net loader covers this method without touching the trainer above.
+load = lut_load

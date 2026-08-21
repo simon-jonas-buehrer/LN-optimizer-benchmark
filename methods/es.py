@@ -37,7 +37,7 @@ import numpy as np
 
 from data import Dataset, DatasetSpec
 from hw import even_thresholds
-from methods.lut import LutModel, pack_encoded
+from methods.lut import LutModel, load as lut_load, pack_encoded
 
 TITLE = "es (evolution strategies, continuous per-LUT weights)"
 
@@ -215,6 +215,8 @@ class _TorchSim:
     def __init__(self, widths, wires, spec: DatasetSpec, n_in: int, device):
         import torch
 
+        import batching   # imported here, not at module scope: this file is numpy-only until CUDA
+
         self.torch = torch
         self.dev = torch.device(device)
         self.widths = list(widths)
@@ -227,7 +229,11 @@ class _TorchSim:
         self.ia = [torch.as_tensor(a, device=self.dev) for a, _ in wires]
         self.ib = [torch.as_tensor(b, device=self.dev) for _, b in wires]
         self.sh = torch.arange(64, dtype=torch.int64, device=self.dev)
-        self.words = max(1, min(_MAX_WORDS_GPU, int(_SIM_MEM // (max(1, self.n_sig) * 8))))
+        # _SIM_MEM is a ceiling tuned on a 24 GB card; on a smaller one take what is actually free
+        # (see `batching.budget`) so a wide net simulates in more, narrower chunks instead of OOMing.
+        self.words = max(1, min(_MAX_WORDS_GPU,
+                                int(batching.budget(_SIM_MEM, device=self.dev)
+                                    // (max(1, self.n_sig) * 8))))
         self.chunk = self.words * 64
         self._bufs, self._tmp = {}, {}
         self._blk = max(1, min(1024, (1 << 24) // max(1, self.words * 64 * 8)))
@@ -385,3 +391,8 @@ class ES(LutModel):
 
 def build(spec, **point) -> ES:
     return ES(spec, **point)
+
+
+# The synthesis phase reloads the trained circuit from its .ckpt; (thresholds, layers) is all of it,
+# so the shared LUT-net loader covers this method without touching the trainer above.
+load = lut_load

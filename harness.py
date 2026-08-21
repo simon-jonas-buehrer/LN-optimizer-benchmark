@@ -614,7 +614,71 @@ def _measure(sv: Path, data: Dataset, spec: DatasetSpec,
 
 
 def run_point(mod: ModuleType, point: dict, data: Dataset, *, device: str, seed: int) -> dict:
-    """Train one point, emit it, synthesize it, and measure the SYNTHESIZED CIRCUIT.
+    """`train_point` then `measure_point`, in one process. The local/one-machine path.
+
+    The cluster runs the two halves as separate jobs -- see those functions for why -- but they
+    compose to exactly this, so the smokes and a laptop run take the same route they always did.
+    """
+    train_point(mod, point, data, device=device, seed=seed)
+    return measure_point(mod, point["name"], data, seed=seed)
+
+
+def train_point(mod: ModuleType, point: dict, data: Dataset, *, device: str, seed: int) -> Path:
+    """Train one point and write its `.ckpt` and `.sv`. NO synthesis: this half wants a GPU.
+
+    Split from the measurement half because the two need opposite machines. Training wants a GPU and
+    a few GB of host RAM; yosys wants no GPU at all and up to ~350 GB of host RAM (the quantized `m`
+    tier). Asking one job for both means every GPU job also reserves the memory of the worst
+    synthesis, which is what made the sweep unschedulable -- a 400 GB request fits on almost no GPU
+    node, while an ordinary CPU node has 1 TB going spare.
+
+    Writes `<stem>.train.json` alongside, carrying the parts of the record only the trainer knows
+    (the config that ran, the pure training seconds, the samples seen). `measure_point` merges it.
+    """
+    spec = data.spec
+    name = mod.__name__.split(".")[-1]
+    cfg = {k: v for k, v in point.items() if k != "name"}
+    print(f"\n=== TRAIN {spec.name}/{name}/{point['name']}  {cfg}  seed={seed}", flush=True)
+    if not hasattr(mod, "load"):
+        raise SystemExit(f"methods/{name}.py must define load(spec, path): the synthesis phase "
+                         f"reloads the trained circuit from its .ckpt to cross-check it")
+    model = mod.build(spec, **cfg)
+    model.spec = spec
+    stem = _stem(name, spec.name, point["name"], seed)
+
+    t0 = time.time()
+    model.train(data, device=device, seed=seed)
+    train_wall_s = time.time() - t0
+    # PURE training time: only the training compute the method measured internally (no validation, no
+    # data staging, no synth/measure). This is the axis for "how fast does each method train".
+    train_s = float(getattr(model, "train_seconds", train_wall_s))
+    # samples the trainer looked at before early-stopping (training-example forward passes):
+    # epochs*Ntrain for the gradient methods, gens*pop(or k)*batch for es/genetic, rounds*Ntrain
+    # for forest. Pairs with train_s as "how long / how much data until it converged".
+    train_samples = int(getattr(model, "train_samples", 0))
+    print(f"[train] {train_s:.0f}s pure ({train_wall_s:.0f}s wall incl. val)  "
+          f"{train_samples:,} samples seen", flush=True)
+
+    # The checkpoint is now load-bearing, not a convenience: it is how the circuit reaches the
+    # synthesis job, and `predict()` reloaded from it is what the netlist is cross-checked against.
+    model.save(str(stem) + ".ckpt")
+    print(f"[ckpt ] {stem.name}.ckpt", flush=True)
+
+    sv = Path(str(stem) + ".sv")
+    sv.write_text(model.emit_verilog())
+    print(f"[emit ] {sv.name}, {sv.stat().st_size / 1e6:.1f} MB", flush=True)
+
+    Path(str(stem) + ".train.json").write_text(json.dumps(
+        {"name": point["name"], "method": name, "dataset": spec.name, "seed": seed, "config": cfg,
+         "config_effective": _jsonable(getattr(model, "cfg", {})),
+         "train_s": round(train_s, 1), "train_wall_s": round(train_wall_s, 1),
+         "train_samples": train_samples, "device": device}, indent=2) + "\n")
+    print(f"[write] {stem.name}.train.json", flush=True)
+    return stem
+
+
+def measure_point(mod: ModuleType, point_name: str, data: Dataset, *, seed: int) -> dict:
+    """Synthesize a trained point's `.sv` and measure the SYNTHESIZED CIRCUIT. No GPU, no training.
 
     The reported (gates, accuracy, loss) triple has to be one real operating point of the emitted
     ASIC, so every axis is tied back to the netlist:
@@ -642,33 +706,22 @@ def run_point(mod: ModuleType, point: dict, data: Dataset, *, device: str, seed:
     NOT done: it would change the design and the gate count, which is the headline measurement.
     """
     spec = data.spec
-    cfg = {k: v for k, v in point.items() if k != "name"}
-    print(f"\n=== {spec.name}/{mod.__name__.split('.')[-1]}/{point['name']}  {cfg}  seed={seed}",
+    name = mod.__name__.split(".")[-1]
+    stem = _stem(name, spec.name, point_name, seed)
+    tj, sv, ck = (Path(str(stem) + e) for e in (".train.json", ".sv", ".ckpt"))
+    for f in (tj, sv, ck):
+        if not f.exists():
+            raise SystemExit(f"{f.name} is missing -- run the training phase for "
+                             f"{spec.name}/{name}/{point_name} first")
+    rec = json.loads(tj.read_text())
+    print(f"\n=== SYNTH {spec.name}/{name}/{point_name}  {rec.get('config', {})}  seed={seed}",
           flush=True)
-    model = mod.build(spec, **cfg)
+
+    # Reload the HARD model. This is the same object the netlist was emitted from -- (thresholds,
+    # layers) / the QLayer list / (trees, w) is the whole circuit -- so `predict()` below is the
+    # same function it would have been in a single-process run, and the cross-check is unweakened.
+    model = mod.load(spec, str(ck))
     model.spec = spec
-    stem = _stem(mod.__name__.split(".")[-1], spec.name, point["name"], seed)
-
-    t0 = time.time()
-    model.train(data, device=device, seed=seed)
-    train_wall_s = time.time() - t0
-    # PURE training time: only the training compute the method measured internally (no validation, no
-    # data staging, no synth/measure). This is the axis for "how fast does each method train".
-    train_s = float(getattr(model, "train_seconds", train_wall_s))
-    # samples the trainer looked at before early-stopping (training-example forward passes):
-    # epochs*Ntrain for the gradient methods, gens*pop(or k)*batch for es/genetic, rounds*Ntrain
-    # for forest. Pairs with train_s as "how long / how much data until it converged".
-    train_samples = int(getattr(model, "train_samples", 0))
-    print(f"[train] {train_s:.0f}s pure ({train_wall_s:.0f}s wall incl. val)  "
-          f"{train_samples:,} samples seen", flush=True)
-
-    if hasattr(model, "save"):
-        model.save(str(stem) + ".ckpt")
-        print(f"[ckpt ] {stem.name}.ckpt", flush=True)
-
-    sv = Path(str(stem) + ".sv")
-    sv.write_text(model.emit_verilog())
-    print(f"[emit ] {sv.name}, {sv.stat().st_size / 1e6:.1f} MB", flush=True)
 
     m, net, hw = measure_full(sv, data)          # hw: the circuit's class per test image
     scores = getattr(model, "scores", lambda _p: None)
@@ -699,11 +752,9 @@ def run_point(mod: ModuleType, point: dict, data: Dataset, *, device: str, seed:
 
     val_acc = float((np.asarray(model.predict(data.val_x)) == data.val_y).mean()) * 100
     sc_va = scores(data.val_x)
-    out = {"name": point["name"], "method": mod.__name__.split(".")[-1], "dataset": spec.name,
-           "seed": seed, "config": cfg, "config_effective": _jsonable(getattr(model, "cfg", {})),
-           **m, "val_acc": round(val_acc, 2),
-           "train_s": round(train_s, 1), "train_wall_s": round(train_wall_s, 1),
-           "train_samples": train_samples, "device": device}
+    # `rec` carries what only the trainer knew (config, train_s, train_samples, the device it ran
+    # on); everything measured is added here, so the published .json is unchanged in shape.
+    out = {**rec, **m, "val_acc": round(val_acc, 2)}
 
     if sc_te is not None:
         t = _fit_temperature(np.asarray(sc_va, float), data.val_y)
@@ -735,9 +786,20 @@ def _jsonable(cfg) -> dict:
     return out
 
 
+def trained(stem: Path) -> bool:
+    """Has the training phase left everything the synthesis phase needs for this point?"""
+    return all(Path(str(stem) + e).exists() for e in (".train.json", ".sv", ".ckpt"))
+
+
 def run_method(name: str, data: Dataset, *, device: str, seed: int,
-               only: list[str] | None, force: bool, keep_going: bool = True) -> None:
+               only: list[str] | None, force: bool, keep_going: bool = True,
+               phase: str = "all") -> None:
     """Run every point of one method's ladder, in order.
+
+    `phase` picks which half runs: "train" (GPU, writes .ckpt/.sv/.train.json), "synth" (no GPU,
+    reads them and writes the measured .json), or "all" for both in one process. A synth pass over
+    a point that has not been trained yet just skips it, so the synthesis job can be launched at the
+    same time as the training job and simply pick up whatever is ready on each pass.
 
     One point that dies (OOM in the trainer, yosys out of memory or over its timeout, a REJECTED
     circuit!=model cross-check) must not take the rest of the ladder with it: an unattended batch
@@ -748,32 +810,57 @@ def run_method(name: str, data: Dataset, *, device: str, seed: int,
     A summary of what failed is printed at the end and re-raised as a non-zero exit, so the batch
     job is still marked FAILED and the gap is impossible to miss.
     """
+    if phase not in ("all", "train", "synth"):
+        raise SystemExit(f"unknown phase {phase!r} (expected all, train or synth)")
     mod = load_method(name)
     failed: list[tuple[str, BaseException]] = []
     for point in mod.points(data.spec):
-        if only and point["name"] not in only:
+        pt = point["name"]
+        if only and pt not in only:
             continue
-        stem = _stem(name, data.spec.name, point["name"], seed)
-        if Path(str(stem) + ".json").exists() and not force:
-            print(f"=== {data.spec.name}/{name}/{point['name']}: done, skipping (--force)", flush=True)
-            continue
+        stem = _stem(name, data.spec.name, pt, seed)
+        tag = f"{data.spec.name}/{name}/{pt}"
+        # what "already done" means depends on the phase: the trainer's product is the .sv+.ckpt,
+        # the measurement's product is the .json.
+        if phase == "train":
+            # Measured counts as done too: the .json is the deliverable, and the .ckpt/.sv that
+            # produced it are regenerable artifacts that are not kept in git. Without this, a fresh
+            # checkout would retrain every point that already has a published result.
+            if (trained(stem) or Path(str(stem) + ".json").exists()) and not force:
+                print(f"=== {tag}: already done, skipping (--force to retrain)", flush=True)
+                continue
+        else:
+            if Path(str(stem) + ".json").exists() and not force:
+                print(f"=== {tag}: measured, skipping (--force to remeasure)", flush=True)
+                continue
+            if phase == "synth" and not trained(stem):
+                print(f"=== {tag}: not trained yet, leaving it for a later pass", flush=True)
+                continue
+
+        def go():
+            if phase == "train":
+                train_point(mod, point, data, device=device, seed=seed)
+            elif phase == "synth":
+                measure_point(mod, pt, data, seed=seed)
+            else:
+                run_point(mod, point, data, device=device, seed=seed)
+
         if not keep_going:
-            run_point(mod, point, data, device=device, seed=seed)
+            go()
             continue
         try:
-            run_point(mod, point, data, device=device, seed=seed)
+            go()
         except KeyboardInterrupt:
             raise
         except BaseException as e:                      # SystemExit (REJECTED) included on purpose
             tb = traceback.format_exc()
-            print(f"\n!!! FAILED {data.spec.name}/{name}/{point['name']}: "
-                  f"{type(e).__name__}: {e}\n{tb}", flush=True)
-            Path(str(stem) + ".failed.txt").write_text(tb)
-            failed.append((point["name"], e))
+            print(f"\n!!! FAILED [{phase}] {tag}: {type(e).__name__}: {e}\n{tb}", flush=True)
+            Path(str(stem) + ".failed.txt").write_text(f"phase: {phase}\n\n{tb}")
+            failed.append((pt, e))
     if failed:
         names = ", ".join(n for n, _ in failed)
-        raise SystemExit(f"{data.spec.name}/{name}: {len(failed)} point(s) failed: {names} "
-                         f"(see results/{data.spec.name}/{name}/*.failed.txt)")
+        raise SystemExit(f"{data.spec.name}/{name}: {len(failed)} point(s) failed in {phase}: "
+                         f"{names} (see results/{data.spec.name}/{name}/*.failed.txt)")
 
 
 def rescore_method(name: str, data: Dataset, seed: int) -> None:

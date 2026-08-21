@@ -581,6 +581,23 @@ class Forest:
             np.savez(f, **d)
 
 
+def load(spec: DatasetSpec, path: str) -> Forest:
+    """Rebuild the boosted forest from a `.ckpt` written by `Forest.save`.
+
+    (trees, w, thresholds) is the whole circuit -- `emit_verilog`, `predict` and `scores` read only
+    those -- so the synthesis phase reloads and cross-checks without re-boosting. `leaves` is a
+    training cap and is not stored; it is irrelevant to an already-grown forest.
+    """
+    with np.load(path) as d:
+        m = Forest(spec, trees=int(d["n_trees"]), leaves=1,
+                   wbits=int(d["wbits"]), bits=int(d["bits"]))
+        m.thresholds = [int(t) for t in d["thresholds"]]
+        m.w = [int(x) for x in d["w"]]
+        m.trees = [{k: d[f"t{i}_{k}"] for k in ("feat", "left", "right", "cls")}
+                   for i in range(int(d["n_trees"]))]
+    return m
+
+
 def points(spec: DatasetSpec) -> list[dict]:
     return [{"name": n, **cfg} for n, cfg in _LADDER.items()]
 
