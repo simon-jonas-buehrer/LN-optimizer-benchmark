@@ -32,8 +32,8 @@ latents and evaluates on hardened tables -- that gap is the method), while every
 
   * DFA has no backward sweep, so the body layers never interact: their latents, feedback matrices
     and gradient accumulators are stored as ONE stacked tensor each (all body layers share `width`).
-    The per-layer feedback matmuls become one, the per-layer scatter_adds become one, Adam sees two
-    parameters instead of `layers+1`, and DDP all-reduces two buffers instead of six.
+    The per-layer feedback matmuls become one, the per-layer scatter_adds become one, and Adam
+    sees two parameters instead of `layers+1`.
   * the fixed global batch is executed as few, wide forwards instead of many tiny ones -- see
     `_Butterfly.merge`. Same images, same gradient, same optimiser step; only how many kernel
     launches it takes, and the order the micro-batch sums are added in.
@@ -64,7 +64,7 @@ import time
 import numpy as np
 import torch
 
-import ddp
+import batching
 from data import Dataset, DatasetSpec
 from hw import even_thresholds
 from methods.lut import LutModel
@@ -327,8 +327,8 @@ class _Butterfly:
 
         The accumulation loop reconstructs the same full-batch gradient however it is cut up, so the
         cut is free to follow the memory: one forward of `micro*g` images instead of `g` forwards of
-        `micro`. `g` divides `accum`, so the effective global batch, the per-rank contiguous shard
-        and `nglobal` are all exactly what they were -- only the float summation order moves.
+        `micro`. `g` divides `accum`, so the effective global batch and `nglobal` are exactly what
+        they were -- only the float summation order moves.
         """
         cap = max(1, _PLANE_BUDGET // max(1, self.plane_bytes() * micro))
         return max(d for d in range(1, accum + 1) if accum % d == 0 and d <= cap)
@@ -414,9 +414,8 @@ class _StepGraph:
     microseconds of launch, so replaying the whole step as one submission is most of the remaining
     time. Nothing about the computation changes: the same kernels run on the same buffers.
 
-    Only the single-GPU path is captured. The gradient all-reduce sits in the middle of the step and
-    NCCL collectives inside a capture need their own stream handling, so under DDP (and on any
-    failure at all) the caller keeps the eager path.
+    On any capture failure at all the caller silently keeps the eager path -- the graph is an
+    optimisation, never a requirement.
 
     The two things that vary between steps are device buffers the caller fills before `replay`:
     `cols` (which images this step sees) and `nglob` (the divisor, which only shrinks on a short
@@ -459,9 +458,9 @@ class _StepGraph:
             self.loss = one_step()
 
     @staticmethod
-    def build(model, net, enc, y_all, Gacc, Gr3, mb, accum, world, device):
+    def build(model, net, enc, y_all, Gacc, Gr3, mb, accum, device):
         """The captured step, or None when this run must stay eager."""
-        if (world != 1 or not _USE_CUDA_GRAPH or torch.device(device).type != "cuda"
+        if (not _USE_CUDA_GRAPH or torch.device(device).type != "cuda"
                 or y_all.shape[0] < mb * accum):
             return None   # no full-size block will ever appear, so there is nothing to capture
         try:
@@ -486,9 +485,9 @@ class Dfa(LutModel):
                  epochs: int, lr: float = 0.01, batch: int = 256, patience: int = 12,
                  micro: int = 1) -> None:
         super().__init__(spec)
-        # `micro` = per-GPU micro-batch, accumulated to the fixed global `batch` (same effective
-        # batch, hence identical result, for every size -- micro only sets accumulation granularity).
-        # micro=1 keeps the 20M-gate xxl tier at ~16.4 GiB/GPU WITH the CUDA graph on (measured on the
+        # `micro` = the micro-batch, accumulated to the fixed global `batch` (same effective batch,
+        # hence identical result, for every size -- micro only sets accumulation granularity).
+        # micro=1 keeps the widest tier at ~16.4 GiB WITH the CUDA graph on (measured on the
         # real trainer): the graph's captured memory pool is what OOMs 24 GB at micro>=2. Smaller
         # tiers have a tiny plane, so `merge` still fuses their whole batch into one graph -- they are
         # unaffected; only xxl falls back to one-image steps, which is the price of fitting 24 GB.
@@ -500,26 +499,15 @@ class Dfa(LutModel):
         n_sig = self.spec.n_pixels * c["bits"] + c["width"] * c["layers"] + c["readout"]
         return max(64, min(4096, 2 ** 28 // n_sig))
 
+    @torch.no_grad()
     def train(self, data: Dataset, *, device: str = "cpu", seed: int = 0) -> None:
-        # Multi-GPU is opt-in via `ddp_gpus` (set by the harness). <=1 GPU runs `_worker` inline, so
-        # this path is byte-for-byte the old DFA trainer; >1 shards each batch across ranks and
-        # all-reduces the hand-written gradient (below), which is exactly the full-batch gradient.
-        self._data, self._seed, self._base_device = data, seed, device
-        res = ddp.launch(self._worker, getattr(self, "ddp_gpus", 1))
-        self.thresholds, self.layers = res["thresholds"], res["layers"]
-        self.train_seconds = res["train_seconds"]  # pure training time (no val/measure)
-        self.train_samples = res["train_samples"]  # training-example evals until early stop
-        self._data = None                          # don't keep the dataset pinned to the model
+        # One process, one device -- the job allocates a single RTX 3090 (or runs on CPU).
         # tell LutModel where to evaluate: its `lut_sim` has a bit-identical CUDA twin, and it owns
         # the crossover gate (small nets lose to numpy) and the numpy fallback.
-        self.sim_device = device
-
-    @torch.no_grad()
-    def _worker(self, rank: int, world: int) -> dict:
-        data, seed, c = self._data, self._seed, self.cfg
-        device = self._base_device if world == 1 else f"cuda:{rank}"
+        self._base_device = self.sim_device = device
+        c = self.cfg
         torch.manual_seed(seed)
-        g = torch.Generator(device=device).manual_seed(seed)  # same draws on every rank (seed-only)
+        g = torch.Generator(device=device).manual_seed(seed)
         net = _Butterfly(self.spec, c["bits"], c["width"], c["layers"], c["readout"], device, g)
 
         enc_tr = _encode(_t(data.train_x, device), net.thresholds)   # (n_in, N)
@@ -541,24 +529,22 @@ class Dfa(LutModel):
             z.grad = torch.empty_like(z)
 
         n = enc_tr.shape[1]
-        step, accum, _ = ddp.accum_plan(c["micro"], world, c["batch"])  # fixed global batch/size
+        step, accum, _ = batching.accum_plan(c["micro"], c["batch"])  # fixed global batch/size
         gmul = net.merge(c["micro"], accum)   # ... executed as fewer, wider forwards where it fits
         step, accum = step * gmul, accum // gmul
         eff = step * accum
-        gstep = _StepGraph.build(self, net, enc_tr, y_tr, Gacc, Gr3, step // world, accum,
-                                 world, device)
-        if rank == 0:
-            print(f"  batch {eff} = {accum} x {step} ({step // world}/rank, "
-                  f"{net.plane_bytes() * step // world / 2**20:.0f} MiB scratch"
-                  f"{', cuda graph' if gstep else ''})", flush=True)
+        gstep = _StepGraph.build(self, net, enc_tr, y_tr, Gacc, Gr3, step, accum, device)
+        print(f"  batch {eff} = {accum} x {step} "
+              f"({net.plane_bytes() * step / 2**20:.0f} MiB scratch"
+              f"{', cuda graph' if gstep else ''})", flush=True)
         best, best_z, best_ep = float("inf"), [z.detach().clone() for z in net.z], 0
         train_secs, t_all, loss_t, nseen = 0.0, time.time(), None, 0
         loss = float("nan")
         for ep in range(c["epochs"]):
             # the loss is a print-only quantity: compute it on the epochs that print it, and nowhere
             # else (identical printed numbers, four fewer kernels on every other micro-batch)
-            want_loss = rank == 0 and (ep % 5 == 0 or ep == c["epochs"] - 1)
-            perm = torch.randperm(n, generator=g, device=device)  # identical on every rank
+            want_loss = ep % 5 == 0 or ep == c["epochs"] - 1
+            perm = torch.randperm(n, generator=g, device=device)
             t0 = time.perf_counter()
             for i in range(0, n, eff):
                 sl = perm[i:i + eff]
@@ -567,18 +553,16 @@ class Dfa(LutModel):
                     opt.step()
                     continue
                 micros = [sl[a * step:(a + 1) * step] for a in range(accum)]
-                micros = [m for m in micros if m.shape[0] >= world]  # deterministic across ranks
+                micros = [m for m in micros if m.shape[0] > 0]
                 if not micros:
                     continue
-                nglobal = sum((m.shape[0] // world) * world for m in micros)  # global samples used
+                nglobal = sum(m.shape[0] for m in micros)  # samples this optimiser step averages
                 torch._foreach_zero_(Gacc)
                 tab = net.tables()  # z is frozen for the whole step: binarize the tables once
                 for m in micros:  # accumulate the raw hand-written gradient over micro-batches
-                    local = ddp.shard(m, rank, world)
-                    loss_t = self._accum_grad(net, enc_tr, local, y_tr[local], nglobal, Gacc, Gr3,
+                    loss_t = self._accum_grad(net, enc_tr, m, y_tr[m], nglobal, Gacc, Gr3,
                                               tab, want_loss)
-                for l, z in enumerate(net.z):  # one all-reduce, then the shared 0.5*cos(z) factor
-                    ddp.all_reduce_(Gacc[l])
+                for l, z in enumerate(net.z):  # the shared 0.5*cos(z) factor
                     torch.cos(z.detach(), out=net._fb[l])
                     net._fb[l] *= 0.5
                     torch.mul(Gacc[l], net._fb[l], out=z.grad)
@@ -589,8 +573,7 @@ class Dfa(LutModel):
             nseen += n  # training-example forward passes this epoch (samples looked at)
             sched.step()
 
-            # rank-0 val loss, broadcast to all -> identical early-stop decision (no DDP deadlock)
-            vl = ddp.broadcast_float(self._val_loss(net, enc_va, y_va) if rank == 0 else 0.0)
+            vl = self._val_loss(net, enc_va, y_va)
             if vl < best - 1e-4:
                 best, best_ep = vl, ep
                 best_z = [z.detach().clone() for z in net.z]
@@ -600,15 +583,15 @@ class Dfa(LutModel):
                       f"(best {best:.4f} @ {best_ep + 1})  "
                       f"{(ep + 1) / (time.time() - t_all):.2f} ep/s", flush=True)
             if ep - best_ep >= c["patience"]:
-                if rank == 0:
-                    print(f"  early stop at epoch {ep + 1}: no gain since {best_ep + 1}", flush=True)
+                print(f"  early stop at epoch {ep + 1}: no gain since {best_ep + 1}", flush=True)
                 break
 
         for z, bz in zip(net.z, best_z):
             z.copy_(bz)
         # hand the hard structure to LutModel: predict/scores/emit all read exactly these arrays
-        return {"thresholds": net.thresholds, "layers": net.layers_np(), "train_seconds": train_secs,
-                "train_samples": nseen}
+        self.thresholds, self.layers = net.thresholds, net.layers_np()
+        self.train_seconds = train_secs   # pure training time (no val/measure)
+        self.train_samples = nseen        # training-example evals until early stop
 
     # ---- the DFA update ------------------------------------------------------------------------
     def _accum_grad(self, net: _Butterfly, enc_all: torch.Tensor, cols: torch.Tensor,
@@ -616,9 +599,9 @@ class Dfa(LutModel):
                     want_loss: bool = True):
         """Add one micro-batch's raw DFA gradient into `Gacc`. No graph, no .backward().
 
-        The error is normalised by the GLOBAL sample count `nglobal`, so summing these raw `G` over
-        every micro-batch AND (in the caller) all-reducing across ranks reconstructs exactly the
-        single-process full-batch gradient. The caller applies the shared 0.5*cos(z) factor and steps.
+        The error is normalised by the whole step's sample count `nglobal`, so summing these raw `G`
+        over every micro-batch reconstructs exactly the full-batch gradient. The caller applies the
+        shared 0.5*cos(z) factor and steps.
 
         Everything is carried TRANSPOSED -- (n_classes, B), (w, B) -- because that is the layout the
         scatter and the feedback matmul want, so nothing is transposed or copied on the hot path. The
@@ -637,7 +620,7 @@ class Dfa(LutModel):
         torch.softmax(pl.vot, 0, out=e)                                      # prob
         loss = -torch.log(e[y, ar] + 1e-12).mean() if want_loss else None    # read before mutating
         e.index_put_((y, ar), net._m1, accumulate=True)                      # e = prob - onehot(y)
-        e /= nglobal                                            # mean over the GLOBAL batch
+        e /= nglobal                                            # mean over the whole step
 
         # only the ACTIVE table entry of each gate gets gradient: G[i,p] += sum_b delta[b,i]
         if net.nb:

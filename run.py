@@ -7,8 +7,8 @@
 
 The five logic-net optimizers and three quantized references, on MNIST and CIFAR10; results land in
 results/<dataset>/<method>/<point>.s<seed>.{sv,ckpt,json}. Resumable: a point whose .json exists is
-skipped unless --force. For 4 GPUs, launch several `run`/`all --device cuda:N` in parallel (the
-gitignored .local/ has sbatch wrappers for the cluster).
+skipped unless --force. Every method trains on ONE device; to use several GPUs, launch several
+`run --device cuda:N` in parallel (the gitignored .local/ has sbatch wrappers for the cluster).
 """
 
 from __future__ import annotations
@@ -31,8 +31,6 @@ def main():
     r.add_argument("--point", action="append")
     r.add_argument("--seed", type=int, default=0)
     r.add_argument("--device", default="cpu")
-    r.add_argument("--gpus", type=int, default=1,
-                   help="GPUs for DDP on the torch methods (backprop/dfa/quant); others use 1")
     r.add_argument("--force", action="store_true")
     r.add_argument("--halt-on-error", action="store_true",
                    help="stop at the first failing point instead of finishing the rest of the ladder")
@@ -42,8 +40,6 @@ def main():
     a.add_argument("--methods", nargs="+", choices=METHODS, default=METHODS)
     a.add_argument("--seeds", nargs="+", type=int, default=[0])
     a.add_argument("--device", default="cpu")
-    a.add_argument("--gpus", type=int, default=1,
-                   help="GPUs for DDP on the torch methods (backprop/dfa/quant); others use 1")
     a.add_argument("--force", action="store_true")
     a.add_argument("--halt-on-error", action="store_true",
                    help="stop at the first failing point instead of finishing the rest of the matrix")
@@ -72,7 +68,7 @@ def main():
                 for method in args.methods:
                     try:
                         harness.run_method(method, dat, device=args.device, seed=seed,
-                                           only=None, force=args.force, gpus=args.gpus,
+                                           only=None, force=args.force,
                                            keep_going=not args.halt_on_error)
                     except SystemExit as e:
                         if args.halt_on_error:
@@ -89,7 +85,7 @@ def main():
     if args.cmd == "rescore":
         return harness.rescore_method(args.method, dat, args.seed)
     harness.run_method(args.method, dat, device=args.device, seed=args.seed,
-                       only=args.point, force=args.force, gpus=args.gpus,
+                       only=args.point, force=args.force,
                        keep_going=not args.halt_on_error)
 
 

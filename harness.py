@@ -613,8 +613,7 @@ def _measure(sv: Path, data: Dataset, spec: DatasetSpec,
     return m, net, pred
 
 
-def run_point(mod: ModuleType, point: dict, data: Dataset, *, device: str, seed: int,
-              gpus: int = 1) -> dict:
+def run_point(mod: ModuleType, point: dict, data: Dataset, *, device: str, seed: int) -> dict:
     """Train one point, emit it, synthesize it, and measure the SYNTHESIZED CIRCUIT.
 
     The reported (gates, accuracy, loss) triple has to be one real operating point of the emitted
@@ -648,7 +647,6 @@ def run_point(mod: ModuleType, point: dict, data: Dataset, *, device: str, seed:
           flush=True)
     model = mod.build(spec, **cfg)
     model.spec = spec
-    model.ddp_gpus = gpus  # torch methods use one DDP rank per GPU; the rest ignore it
     stem = _stem(mod.__name__.split(".")[-1], spec.name, point["name"], seed)
 
     t0 = time.time()
@@ -738,8 +736,7 @@ def _jsonable(cfg) -> dict:
 
 
 def run_method(name: str, data: Dataset, *, device: str, seed: int,
-               only: list[str] | None, force: bool, gpus: int = 1,
-               keep_going: bool = True) -> None:
+               only: list[str] | None, force: bool, keep_going: bool = True) -> None:
     """Run every point of one method's ladder, in order.
 
     One point that dies (OOM in the trainer, yosys out of memory or over its timeout, a REJECTED
@@ -761,10 +758,10 @@ def run_method(name: str, data: Dataset, *, device: str, seed: int,
             print(f"=== {data.spec.name}/{name}/{point['name']}: done, skipping (--force)", flush=True)
             continue
         if not keep_going:
-            run_point(mod, point, data, device=device, seed=seed, gpus=gpus)
+            run_point(mod, point, data, device=device, seed=seed)
             continue
         try:
-            run_point(mod, point, data, device=device, seed=seed, gpus=gpus)
+            run_point(mod, point, data, device=device, seed=seed)
         except KeyboardInterrupt:
             raise
         except BaseException as e:                      # SystemExit (REJECTED) included on purpose

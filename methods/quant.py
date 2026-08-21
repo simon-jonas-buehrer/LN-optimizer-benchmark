@@ -39,9 +39,8 @@ import time
 import numpy as np
 import torch
 import torch.nn.functional as F
-from torch.nn.parallel import DistributedDataParallel as DDP
 
-import ddp
+import batching
 from data import Dataset, DatasetSpec
 from hw import QLayer, emit_quant_mlp, input_activations, qmlp_forward
 
@@ -50,12 +49,9 @@ _SH = 16  # requant fixed-point shift; mul = round(scale * 2^_SH)
 # Training-speed switches.
 #
 # NOTE FOR ANYONE ABLATING THESE: they are module globals resolved from the ENVIRONMENT at import
-# time. `ddp.launch` starts the >1-GPU ranks with torch.multiprocessing *spawn*, so each child
-# RE-IMPORTS this module and re-reads the environment -- assigning `methods.quant._COMPILE = False`
-# in the parent process does NOT reach the DDP children, which will silently keep the default. To
-# ablate a multi-GPU run, set the env var (e.g. MNISTBENCH_QUANT_COMPILE=0) before launching, not
-# the attribute. (A single-GPU/CPU run executes inline, so there the attribute does work -- which is
-# exactly what makes the mistake easy to miss.)
+# time, so `MNISTBENCH_QUANT_COMPILE=0 python run.py ...` works but assigning
+# `methods.quant._COMPILE = False` after import does not re-read anything -- set the attribute
+# before the first training call, or just use the env var.
 def _flag(name, default=True):
     v = os.environ.get(name)
     return default if v is None else v not in ("0", "false", "False", "")
@@ -137,8 +133,8 @@ class QuantModel:
     def __init__(self, spec: DatasetSpec, wmode: str, abits: int, hidden, epochs=200, lr=0.01,
                  batch=128, patience=20, micro=32):
         self.spec, self.wmode, self.abits, self.hidden = spec, wmode, abits, tuple(hidden)
-        # `micro` = per-GPU micro-batch; with `world` GPUs it sets the global batch together with
-        # `batch` (kept for compatibility -- the global batch per optimiser step is unchanged).
+        # `micro` = the micro-batch that goes through one forward; `batch` is the global batch an
+        # optimiser step averages, reached by accumulation (batching.accum_plan).
         # `hidden`/`wmode`/`abits` are recorded too so config_effective is self-describing: the
         # ladder point names only `hidden`, and everything else here is a default.
         self.cfg = dict(hidden=self.hidden, wmode=wmode, abits=abits, epochs=epochs, lr=lr,
@@ -190,20 +186,12 @@ class QuantModel:
                                     for L in self.layers]}, f)
 
     def train(self, data: Dataset, *, device="cpu", seed=0):
-        # Multi-GPU is opt-in via `ddp_gpus` (set by the harness). <=1 GPU runs `_worker` inline;
-        # >1 spawns one DDP rank per GPU.
-        self._data, self._seed, self._base_device = data, seed, device
-        res = ddp.launch(self._worker, getattr(self, "ddp_gpus", 1))
-        self.layers, self.train_seconds = res["layers"], res["train_seconds"]
-        self.train_samples = res["train_samples"]  # training-example evals until early stop
-        self._gemm, self._logits = {}, {}
-
-    def _worker(self, rank, world):
-        data, seed, c = self._data, self._seed, self.cfg
-        device = self._base_device if world == 1 else f"cuda:{rank}"
+        # One process, one device -- the job allocates a single RTX 3090 (or runs on CPU).
+        self._data, self._base_device = data, device
+        c = self.cfg
         cuda = str(device).startswith("cuda")
         torch.manual_seed(seed)
-        g = torch.Generator().manual_seed(seed)  # CPU generator -> identical init on every rank
+        g = torch.Generator().manual_seed(seed)  # CPU generator -> device-independent init
         dims = [self.spec.n_pixels, *self.hidden, self.spec.n_classes]
         finals = [False] * (len(dims) - 2) + [True]
         net = torch.nn.Sequential(
@@ -219,15 +207,17 @@ class QuantModel:
             torch.backends.cuda.matmul.allow_tf32 = True
             torch.backends.cudnn.allow_tf32 = True
         try:
-            net, train_secs, nseen = self._fit(net, rank, world, device, cuda, c)
+            net, train_secs, nseen = self._fit(net, device, cuda, c)
         finally:
             torch.backends.cuda.matmul.allow_tf32, torch.backends.cudnn.allow_tf32 = tf32_was
         # eager, fp32, TF32 restored -> `export` is exactly the integer model the emitter turns
         # into gates and `predict()` recomputes.
-        return {"layers": [L.export() for L in net], "train_seconds": train_secs,
-                "train_samples": nseen}
+        self.layers = [L.export() for L in net]
+        self.train_seconds = train_secs   # pure training time (no val/measure)
+        self.train_samples = nseen        # training-example evals until early stop
+        self._data, self._gemm, self._logits = None, {}, {}
 
-    def _fit(self, net, rank, world, device, cuda, c):
+    def _fit(self, net, device, cuda, c):
         """Train in place and return (net, pure_training_seconds). Training numerics are free to
         drift (compile / TF32 / fused Adam / one fused batch per step); only `export` is exact."""
         x = _t(self._in_np(self._data.train_x, np.float32), device)
@@ -248,43 +238,34 @@ class QuantModel:
                     cand(x[:2])
                 core = cand
             except Exception as e:
-                if rank == 0:
-                    print(f"  [compile] unavailable, running eager ({type(e).__name__}: "
-                          f"{str(e).splitlines()[0][:120]})", flush=True)
+                print(f"  [compile] unavailable, running eager ({type(e).__name__}: "
+                      f"{str(e).splitlines()[0][:120]})", flush=True)
                 core = net
-        # final layer's log_s is unused (no requant on the logits), so DDP must tolerate it
-        train_net = (DDP(core, device_ids=[rank], find_unused_parameters=True) if world > 1 else core)
         opt = torch.optim.Adam(net.parameters(), lr=c["lr"],
                                **({"fused": True} if (_FUSED_ADAM and cuda) else {}))
         sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=c["epochs"])
-        step, accum, gstep = ddp.accum_plan(c["micro"], world, c["batch"])  # gstep = global batch
+        step, accum, gstep = batching.accum_plan(c["micro"], c["batch"])  # gstep = global batch
         best, best_state, best_ep, train_secs, nseen = float("inf"), None, 0, 0.0, 0
         n_train = x.shape[0]
         for ep in range(c["epochs"]):
-            perm = torch.randperm(n_train, device=device)  # same on every rank (same seed)
+            perm = torch.randperm(n_train, device=device)
             t0 = time.perf_counter()
             for i in range(0, n_train, gstep):
                 idx = perm[i:i + gstep]
-                if idx.shape[0] < world:
+                if idx.shape[0] == 0:
                     continue
-                local = ddp.shard(idx, rank, world)
                 opt.zero_grad(set_to_none=True)
-                F.cross_entropy(train_net(x[local]), y[local]).backward()
+                F.cross_entropy(core(x[idx]), y[idx]).backward()
                 opt.step()
             if cuda:
                 torch.cuda.synchronize(device)
             train_secs += time.perf_counter() - t0
             nseen += n_train  # training-example forward passes this epoch (samples looked at)
             sched.step()
-            # rank-0 val loss, broadcast to all -> identical early-stop decision (no DDP deadlock)
-            if rank == 0:
-                with torch.no_grad():
-                    vl = sum(F.cross_entropy(core(vx[i:i + 4096]), vy[i:i + 4096],
-                                             reduction="sum").item()
-                             for i in range(0, vx.shape[0], 4096)) / vx.shape[0]
-            else:
-                vl = 0.0
-            vl = ddp.broadcast_float(vl)
+            with torch.no_grad():
+                vl = sum(F.cross_entropy(core(vx[i:i + 4096]), vy[i:i + 4096],
+                                         reduction="sum").item()
+                         for i in range(0, vx.shape[0], 4096)) / vx.shape[0]
             if vl < best - 1e-4:
                 best, best_ep = vl, ep
                 if best_state is None:  # reuse the buffers; a full clone per improvement is churn
@@ -293,12 +274,11 @@ class QuantModel:
                     with torch.no_grad():
                         for k, v in net.state_dict().items():
                             best_state[k].copy_(v)
-            if rank == 0 and (ep % 5 == 0 or ep == c["epochs"] - 1):
+            if ep % 5 == 0 or ep == c["epochs"] - 1:
                 print(f"  epoch {ep + 1:3d}/{c['epochs']}  val loss {vl:.4f}  (best {best:.4f} @ {best_ep + 1})",
                       flush=True)
             if ep - best_ep >= c["patience"]:
-                if rank == 0:
-                    print(f"  early stop at epoch {ep + 1}", flush=True)
+                print(f"  early stop at epoch {ep + 1}", flush=True)
                 break
         if best_state is not None:      # None only when epochs == 0 (a structure-only probe)
             net.load_state_dict(best_state)

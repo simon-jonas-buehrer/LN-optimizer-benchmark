@@ -10,14 +10,12 @@ from __future__ import annotations
 
 import os
 import time
-from contextlib import nullcontext
 
 import numpy as np
 import torch
 import torch.nn.functional as F
-from torch.nn.parallel import DistributedDataParallel as DDP
 
-import ddp
+import batching
 from data import Dataset, DatasetSpec
 from hw import even_thresholds
 from methods.lut import LutModel, lut_sim
@@ -228,28 +226,29 @@ class _Net(torch.nn.Module):
             (self.widths[-1] // self.spec.n_classes) ** 0.5
 
 
-def _accum_loss(out, tgt, shards, n_micros):
+def _accum_loss(out, tgt, parts, n_micros):
     """Loss of one (possibly fused) accumulation step == sum of the per-micro mean losses / n.
 
     One micro per step is literally the un-fused expression. k fused micros of equal size reach the
     same number with a single mean reduction; ragged micros (only possible when the split size is
     not a multiple of `micro`) fall back to explicit per-sample weights.
     """
-    if len(shards) == 1:
+    if len(parts) == 1:
         return F.cross_entropy(out, tgt) / n_micros
-    n0 = shards[0].shape[0]
-    if all(s.shape[0] == n0 for s in shards):
-        return F.cross_entropy(out, tgt) * (len(shards) / n_micros)
+    n0 = parts[0].shape[0]
+    if all(s.shape[0] == n0 for s in parts):
+        return F.cross_entropy(out, tgt) * (len(parts) / n_micros)
     w = torch.cat([torch.full((s.shape[0],), 1.0 / (n_micros * s.shape[0]),
-                              dtype=out.dtype, device=out.device) for s in shards])
+                              dtype=out.dtype, device=out.device) for s in parts])
     return (F.cross_entropy(out, tgt, reduction="none") * w).sum()
 
 
 class Backprop(LutModel):
     def __init__(self, spec, bits, widths, epochs, lr=0.2, batch=128, cands=8, patience=40, micro=8):
         super().__init__(spec)
-        # `micro` is the per-GPU micro-batch (kept small so even the 20M-gate net fits 24 GB); the
-        # optimiser sees an accumulated global batch of >=32 (ddp.accum_plan). `batch` is unused now.
+        # `micro` is the micro-batch (kept small so even the widest net fits one 24 GB card); the
+        # optimiser sees an accumulated global batch of >=32 (batching.accum_plan). `batch` is
+        # unused now.
         self.cfg = dict(bits=bits, widths=tuple(widths), epochs=epochs, lr=lr, batch=batch,
                         cands=cands, patience=patience, micro=micro)
 
@@ -313,23 +312,12 @@ class Backprop(LutModel):
         return f if cap <= 0 else max(1, min(f, cap))   # =1 -> the bit-exact un-fused path
 
     def train(self, data: Dataset, *, device="cpu", seed=0):
-        # Multi-GPU is opt-in via `ddp_gpus` (set by the harness). ddp.launch runs `_worker` on one
-        # process per GPU; with <=1 GPU it runs inline -> this path is byte-for-byte the old trainer.
-        self._data, self._seed, self._base_device = data, seed, device
-        res = ddp.launch(self._worker, getattr(self, "ddp_gpus", 1))
-        self.thresholds, self.layers = res["thresholds"], res["layers"]
-        self.train_seconds = res["train_seconds"]  # pure training time (no val/measure), for the json
-        self.train_samples = res["train_samples"]  # training-example evals until early stop
-        self._counts_memo = None
-        self._data = None  # only needed to reach the worker; don't pin the dataset afterwards
-
-    def _worker(self, rank, world):
-        data, seed, c = self._data, self._seed, self.cfg
-        device = self._base_device if world == 1 else f"cuda:{rank}"
-        torch.manual_seed(seed)  # identical seed on every rank -> identical init AND identical perm
+        # One process, one device -- the job allocates a single RTX 3090 (or runs on CPU).
+        self._base_device = device
+        c = self.cfg
+        torch.manual_seed(seed)
         m = _Net(self.spec, c["bits"], c["widths"], c["cands"], seed).to(device)
         m.act = self._act(device)
-        train_m = DDP(m, device_ids=[rank]) if world > 1 else m  # DDP averages grads across ranks
         opt = torch.optim.Adam(m.parameters(), lr=c["lr"])
         sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=c["epochs"])
         # thermometer-encode both splits once, on-device, instead of once per micro-batch per epoch
@@ -337,52 +325,41 @@ class Backprop(LutModel):
         ev, vy = m.encode_all(data.val_x, device), _t(data.val_y, device)
         n_train, n_val = ex.shape[0], ev.shape[0]
         ch = self._chunk()
-        # fixed protocol for every size of this method: per-GPU micro-batch `micro` (small, fits the
-        # 20M-gate net), accumulated to the method's global batch `batch` -- constant across sizes.
-        step, accum, _ = ddp.accum_plan(c["micro"], world, c["batch"])
+        # fixed protocol for every size of this method: micro-batch `micro` (small, fits the widest
+        # net on one card), accumulated to the method's global batch `batch` -- constant across sizes.
+        step, accum, _ = batching.accum_plan(c["micro"], c["batch"])
         fuse = self._fuse(step, accum)
         global _GS   # set explicitly every run, so one process can train several models
         work = (c["epochs"] * -(-n_train // (step * accum))        # optimiser steps
-                * (step * accum // world) * 2 * c["cands"] * sum(c["widths"]))   # elems per step
+                * (step * accum) * 2 * c["cands"] * sum(c["widths"]))   # elems per step
         _GS = _compiled_gs(device, m.act) if self._use_compile(work) else _gs_kernel
         best, best_state, best_ep, train_secs, nseen = float("inf"), None, 0, 0.0, 0
         for ep in range(c["epochs"]):
-            perm = torch.randperm(n_train, device=device)  # same on every rank (same seed)
+            perm = torch.randperm(n_train, device=device)
             t0 = time.perf_counter()
             for i in range(0, n_train, step * accum):
                 micros = [perm[i + a * step:i + (a + 1) * step] for a in range(accum)]
-                micros = [mb for mb in micros if mb.shape[0] >= world]  # deterministic across ranks
+                micros = [mb for mb in micros if mb.shape[0] > 0]
                 if not micros:
                     continue
                 opt.zero_grad(set_to_none=True)
-                groups = [micros[a:a + fuse] for a in range(0, len(micros), fuse)]
-                for j, grp in enumerate(groups):
-                    shards = [ddp.shard(mb, rank, world) for mb in grp]  # ~micro per rank each
-                    local = shards[0] if len(shards) == 1 else torch.cat(shards)
-                    sync = nullcontext() if (world == 1 or j == len(groups) - 1) else train_m.no_sync()
-                    with sync:  # DDP all-reduces once, on the last (fused) step of the accumulation
-                        _accum_loss(train_m(ex[local].to(m.act)), y[local], shards,
-                                    len(micros)).backward()
+                for grp in [micros[a:a + fuse] for a in range(0, len(micros), fuse)]:
+                    idx = grp[0] if len(grp) == 1 else torch.cat(grp)
+                    _accum_loss(m(ex[idx].to(m.act)), y[idx], grp, len(micros)).backward()
                 opt.step()
             if ex.is_cuda:
                 torch.cuda.synchronize(device)
             train_secs += time.perf_counter() - t0
             nseen += n_train  # training-example forward passes this epoch (samples looked at)
             sched.step()
-            # early stop on val LOSS (forward is already hard = the circuit). Compute it on rank 0
-            # only and broadcast, so every rank breaks on the SAME number (GPU reductions differ in
-            # the last bits across devices, and a diverging break would deadlock DDP).
-            if rank == 0:
-                with torch.no_grad():  # no_grad also drops the wiring-gradient term in _LutLayer
-                    parts = torch.stack([
-                        F.cross_entropy(m(ev[i:i + ch].to(m.act)), vy[i:i + ch], reduction="sum")
-                        for i in range(0, n_val, ch)])
-                # ONE device->host copy per epoch, then the same python summation order the
-                # per-chunk `.item()` loop used -> bit-identical val loss without a sync per chunk
-                vl = sum(float(v) for v in parts.cpu()) / n_val
-            else:
-                vl = 0.0
-            vl = ddp.broadcast_float(vl)
+            # early stop on val LOSS (forward is already hard = the circuit)
+            with torch.no_grad():  # no_grad also drops the wiring-gradient term in _LutLayer
+                parts = torch.stack([
+                    F.cross_entropy(m(ev[i:i + ch].to(m.act)), vy[i:i + ch], reduction="sum")
+                    for i in range(0, n_val, ch)])
+            # ONE device->host copy per epoch, then the same python summation order the per-chunk
+            # `.item()` loop used -> bit-identical val loss without a sync per chunk
+            vl = sum(float(v) for v in parts.cpu()) / n_val
             if vl < best - 1e-4:
                 best, best_ep = vl, ep
                 # snapshot into pre-allocated buffers (copy_ instead of a fresh clone per epoch);
@@ -393,12 +370,11 @@ class Backprop(LutModel):
                     with torch.no_grad():
                         for dst, p in zip(best_state, m.parameters()):
                             dst.copy_(p.detach())
-            if rank == 0 and (ep % 5 == 0 or ep == c["epochs"] - 1):
+            if ep % 5 == 0 or ep == c["epochs"] - 1:
                 print(f"  epoch {ep + 1:3d}/{c['epochs']}  val loss {vl:.4f}  (best {best:.4f} @ {best_ep + 1})",
                       flush=True)
             if ep - best_ep >= c["patience"]:
-                if rank == 0:
-                    print(f"  early stop at epoch {ep + 1}", flush=True)
+                print(f"  early stop at epoch {ep + 1}", flush=True)
                 break
         if best_state is not None:
             with torch.no_grad():
@@ -406,10 +382,12 @@ class Backprop(LutModel):
                     p.copy_(b)
         with torch.no_grad():   # one wires() per layer, not two (it argmaxes the whole conn tensor)
             wires = [lay.wires().cpu().numpy() for lay in m.layers]
-            layers = [(w[0], w[1], lay.truth_table().cpu().numpy())
-                      for w, lay in zip(wires, m.layers)]
-        return {"thresholds": m.thresholds, "train_seconds": train_secs, "train_samples": nseen,
-                "layers": layers}
+            self.layers = [(w[0], w[1], lay.truth_table().cpu().numpy())
+                           for w, lay in zip(wires, m.layers)]
+        self.thresholds = m.thresholds
+        self.train_seconds = train_secs   # pure training time (no val/measure), for the json
+        self.train_samples = nseen        # training-example evals until early stop
+        self._counts_memo = None
 
     def _counts(self, pix: np.ndarray) -> np.ndarray:
         """On a CUDA run, evaluate through lut_sim's GPU backend (bit-for-bit equal to numpy).

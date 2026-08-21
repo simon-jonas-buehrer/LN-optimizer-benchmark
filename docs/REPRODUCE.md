@@ -52,9 +52,10 @@ MNISTBENCH_EDA=/path/to/eda python run.py rescore backprop --dataset mnist
 
 ```bash
 python run.py all --device cuda           # the whole matrix, resumable
-# or one cell, or spread across 4 GPUs by launching several:
-python run.py run backprop --dataset mnist --device cuda:0 &
-python run.py run forest   --dataset cifar10 --device cuda:1 &
+# Every method trains in ONE process on ONE device, so several GPUs means several processes --
+# one method x dataset cell each:
+python run.py run backprop --dataset mnist   --device cuda:0 &
+python run.py run forest   --dataset cifar10 --device cpu    &
 python run.py plots                        # the four figures + results/leaderboard.md
 ```
 
@@ -116,11 +117,12 @@ can never reach the plots; the process still exits non-zero with a list of what 
   floor); their curves start higher, which is reported, not forced.
 * **CIFAR10 is hard for logic nets** — low absolute accuracy is expected and is itself a finding.
 * **`train_s` is not cross-method comparable.** It is wall-clock on whatever device that method
-  ran on (4×3090 DDP for backprop/dfa/quant, 1×3090 for es/genetic, CPU for forest). It is a
-  within-method scaling quantity; comparing it across methods compares hardware allocations, not
-  optimizers.
+  ran on (one RTX 3090 for every method except forest, which is CPU). It is a within-method
+  scaling quantity; comparing it across methods compares hardware allocations, not optimizers.
 
 ## Cluster
 
 Cluster-specific `sbatch` wrappers live in the gitignored `.local/` (see `.local/README.md`); they
 just `exec python run.py ...` inside the SLURM job, so cluster and local runs are the same code.
+The GPU sweep is a four-task array holding one GPU each, which schedules where a single four-GPU
+allocation would not.
