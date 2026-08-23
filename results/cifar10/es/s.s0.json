@@ -1,0 +1,44 @@
+{
+  "name": "s",
+  "method": "es",
+  "dataset": "cifar10",
+  "seed": 0,
+  "config": {
+    "bits": 1,
+    "widths": [
+      4000,
+      2000
+    ],
+    "gens": 3000
+  },
+  "config_effective": {
+    "gens": 3000,
+    "pop": 40,
+    "sigma": 0.1,
+    "lr": 0.1,
+    "batch": 2048,
+    "patience": 20,
+    "eval_every": 10
+  },
+  "train_s": 125.9,
+  "train_wall_s": 128.4,
+  "train_samples": 123781120,
+  "device": "cuda",
+  "gates": 21788,
+  "nand": 13721,
+  "inv": 8067,
+  "depth": 236,
+  "test_acc": 21.8,
+  "ge": 17841.3,
+  "area_um2": 66969.2,
+  "cells": 11927,
+  "ge_pre_abc": 30969.0,
+  "ge_post_abc": 17841.3,
+  "cells_pre_abc": 19667,
+  "cells_post_abc": 11927,
+  "ge_abc_ratio": 1.736,
+  "val_acc": 22.24,
+  "test_ce": 2.1533,
+  "test_ppl": 8.6133,
+  "ce_temp": 0.0419
+}

@@ -1,0 +1,44 @@
+{
+  "name": "xs",
+  "method": "w1_58a4",
+  "dataset": "mnist",
+  "seed": 0,
+  "config": {
+    "hidden": [
+      64
+    ]
+  },
+  "config_effective": {
+    "hidden": [
+      64
+    ],
+    "wmode": "ternary",
+    "abits": 4,
+    "epochs": 200,
+    "lr": 0.01,
+    "batch": 128,
+    "patience": 20,
+    "micro": 32
+  },
+  "train_s": 114.3,
+  "train_wall_s": 121.9,
+  "train_samples": 3348000,
+  "device": "cuda",
+  "gates": 628153,
+  "nand": 433519,
+  "inv": 194634,
+  "depth": 428,
+  "test_acc": 95.72,
+  "ge": 544260.3,
+  "area_um2": 2042935.6,
+  "cells": 372955,
+  "ge_pre_abc": 583195.7,
+  "ge_post_abc": 544260.3,
+  "cells_pre_abc": 333463,
+  "cells_post_abc": 372955,
+  "ge_abc_ratio": 1.072,
+  "val_acc": 95.12,
+  "test_ce": 0.1418,
+  "test_ppl": 1.1523,
+  "ce_temp": 1.3046
+}
