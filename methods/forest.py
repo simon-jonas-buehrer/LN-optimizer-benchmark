@@ -31,7 +31,7 @@ from concurrent.futures import ThreadPoolExecutor
 import numpy as np
 
 from data import Dataset, DatasetSpec
-from hw import even_thresholds
+from hw import even_thresholds, fold_sum
 
 TITLE = "forest (SAMME-boosted decision trees, integer-weighted vote)"
 
@@ -545,8 +545,10 @@ class Forest:
                          if (self.w[t] >> b) & 1 and c in vind[t]]
                 if not terms:
                     continue
+                # a popcount tree at exact widths, not a chain of W-bit adds over 1-bit terms
+                e, _ = fold_sum(body, f"pc{b}_{c}_", [(t, 1) for t in terms])
                 body.append(f"  logic [{W - 1}:0] p{b}_c{c};")
-                body.append(f"  assign p{b}_c{c} = {' + '.join(terms)};")
+                body.append(f"  assign p{b}_c{c} = {e};")
                 planes.append(f"{1 << b} * p{b}_c{c}" if b else f"p{b}_c{c}")
             rhs = " + ".join(planes) if planes else f"{W}'d0"
             body.append(f"  assign score[{c}] = {rhs};")

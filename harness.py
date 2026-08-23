@@ -16,9 +16,15 @@ where `model` (duck-typed, no base class) has:
 The harness sets `model.spec` before training. Per point it writes, under
 `results/<dataset>/<method>/`:
 
-    <point>.s<seed>.sv       emitted SystemVerilog
-    <point>.s<seed>.ckpt     trained checkpoint (if the model implements save)
-    <point>.s<seed>.json     accuracy, loss, perplexity, nand/inv/gate count, sky130 GE, config
+    <point>.s<seed>.sv            emitted SystemVerilog -- the model as RTL, technology-independent
+    <point>.s<seed>.pre_opt.sv    that RTL mapped to sky130 cells with NO ABC optimisation
+    <point>.s<seed>.post_opt.sv   the same, after ABC's area pass -- the netlist `ge` describes
+    <point>.s<seed>.ckpt          trained checkpoint (if the model implements save)
+    <point>.s<seed>.json          accuracy, loss, perplexity, nand/inv/gate count, sky130 GE, config
+
+The two mapped netlists are the artifacts behind `ge_pre_abc` / `ge_post_abc`: each is written by
+the very yosys process that reported its own `stat`, so a file and its number cannot disagree, and
+either can be re-measured or handed to a P&R flow without re-running synthesis.
 
 Area (headline) is the raw 2-input gate count (NAND2+INV) of the fast-ABC netlist; accuracy is read
 off that same netlist; sky130 GE is measured too when a liberty is configured.
@@ -45,7 +51,10 @@ import numpy as np
 from data import Dataset, DatasetSpec, to_bits
 
 ROOT = Path(__file__).resolve().parent
-RESULTS = ROOT / "results"
+# MNISTBENCH_RESULTS redirects the whole output tree. Assigning `harness.RESULTS` works too, but
+# only inside one process -- the smokes drive `.local/reemit.py` as a SUBPROCESS, and an env var is
+# the only way to point that at a throwaway tree instead of the real results/.
+RESULTS = Path(os.environ.get("MNISTBENCH_RESULTS") or ROOT / "results")
 CHECK_SAMPLES = 512   # historical floor only: run_point now cross-checks the FULL test set
                       # (the circuit predictions it compares against are computed for test_acc anyway)
 
@@ -184,12 +193,20 @@ def synth_nand(sv: Path, *, script: str = FAST, top: str = "top", timeout: int =
     return Nand(netlist, counts.get("NAND", 0), counts.get("NOT", 0), net)
 
 
-def synth_ge(sv: Path, *, script: str = FAST, top: str = "top", timeout: int = 14400) -> tuple[float, float, int]:
-    """Optional: map to sky130 cells -> (gate equivalents, area um^2, cell count). Needs a liberty."""
+def synth_ge(sv: Path, *, script: str = FAST, top: str = "top", timeout: int = 14400,
+             save: Path | None = None) -> tuple[float, float, int]:
+    """Optional: map to sky130 cells -> (gate equivalents, area um^2, cell count). Needs a liberty.
+
+    With `save`, the mapped netlist is written there as structural Verilog instantiating
+    sky130_fd_sc_hd cells. It comes out of the SAME yosys process that produced the `stat` this
+    function parses, so the saved file always is the design the returned GE describes -- which is
+    the point of writing it here rather than in a separate pass.
+    """
     if not LIBERTY:
         raise RuntimeError("no sky130 liberty configured (set MNISTBENCH_LIBERTY)")
+    writer = f"; write_verilog -noattr {save.resolve()}" if save is not None else ""
     cmds = (f"read_verilog -sv {sv.resolve()}; synth -top {top} -flatten -noabc; opt -full; "
-            f"abc -liberty {LIBERTY} -script +{script}; opt_clean; stat -liberty {LIBERTY}")
+            f"abc -liberty {LIBERTY} -script +{script}; opt_clean; stat -liberty {LIBERTY}{writer}")
     with tempfile.TemporaryDirectory() as td:
         log = _run(cmds, td, timeout)
     tail = log[log.rfind("Printing statistics"):]
@@ -568,7 +585,12 @@ def measure_full(sv: Path, data: Dataset) -> tuple[dict, NandNet, np.ndarray]:
             submit = pool.submit
         else:
             submit = _Later                       # serial fallback, run on .result()
-        ge_jobs = [submit(synth_ge, sv, script=FAST), submit(synth_ge, sv, script=GE_MAP)]
+        # Keep both mapped netlists next to the RTL they came from. FAST is the optimised one
+        # (strash;dc2;map), GE_MAP the unoptimised reference (strash;map) -- same order as the
+        # ge_jobs[0]/ge_jobs[1] unpacking in `_measure`.
+        stem = sv.with_suffix("")                       # results/<ds>/<method>/<point>.s<seed>
+        ge_jobs = [submit(synth_ge, sv, script=FAST, save=Path(f"{stem}.post_opt.sv")),
+                   submit(synth_ge, sv, script=GE_MAP, save=Path(f"{stem}.pre_opt.sv"))]
     try:
         return _measure(sv, data, spec, ge_jobs)
     finally:
@@ -614,17 +636,19 @@ def _measure(sv: Path, data: Dataset, spec: DatasetSpec,
 
 
 def run_point(mod: ModuleType, point: dict, data: Dataset, *, device: str, seed: int) -> dict:
-    """`train_point` then `measure_point`, in one process. The local/one-machine path.
+    """`train_point` -> `emit_point` -> `measure_point`, in one process. The one-machine path.
 
-    The cluster runs the two halves as separate jobs -- see those functions for why -- but they
+    The cluster runs the three phases as separate jobs -- see those functions for why -- but they
     compose to exactly this, so the smokes and a laptop run take the same route they always did.
     """
     train_point(mod, point, data, device=device, seed=seed)
+    emit_point(mod, point["name"], data.spec, seed=seed)
     return measure_point(mod, point["name"], data, seed=seed)
 
 
 def train_point(mod: ModuleType, point: dict, data: Dataset, *, device: str, seed: int) -> Path:
-    """Train one point and write its `.ckpt` and `.sv`. NO synthesis: this half wants a GPU.
+    """Train one point and write its `.ckpt` and `.train.json`. NO RTL and no synthesis: this
+    phase wants a GPU, and the other two want a machine without one.
 
     Split from the measurement half because the two need opposite machines. Training wants a GPU and
     a few GB of host RAM; yosys wants no GPU at all and up to ~350 GB of host RAM (the quantized `m`
@@ -664,10 +688,6 @@ def train_point(mod: ModuleType, point: dict, data: Dataset, *, device: str, see
     model.save(str(stem) + ".ckpt")
     print(f"[ckpt ] {stem.name}.ckpt", flush=True)
 
-    sv = Path(str(stem) + ".sv")
-    sv.write_text(model.emit_verilog())
-    print(f"[emit ] {sv.name}, {sv.stat().st_size / 1e6:.1f} MB", flush=True)
-
     Path(str(stem) + ".train.json").write_text(json.dumps(
         {"name": point["name"], "method": name, "dataset": spec.name, "seed": seed, "config": cfg,
          "config_effective": _jsonable(getattr(model, "cfg", {})),
@@ -675,6 +695,44 @@ def train_point(mod: ModuleType, point: dict, data: Dataset, *, device: str, see
          "train_samples": train_samples, "device": device}, indent=2) + "\n")
     print(f"[write] {stem.name}.train.json", flush=True)
     return stem
+
+
+def emit_point(mod: ModuleType, point_name: str, spec: DatasetSpec, *, seed: int) -> Path:
+    """Reload a trained point's checkpoint and write its `.sv`. No GPU, no yosys, no dataset.
+
+    Its own phase because a `.sv` is a pure function of (checkpoint, emitter) and the checkpoint is
+    the expensive half. Improving the RTL then costs one cheap pass over `results/` instead of a
+    retrain -- and re-emitting EVERY point from one emitter is also what keeps a ladder comparable,
+    since a long training run spans emitter changes (python imports at process start, so a job that
+    was already running keeps the emitter it started with).
+
+    The write is a rename over the original, which is atomic on POSIX, so a synthesis job running
+    beside this can never read a half-written netlist. The measured `.json` and the two mapped
+    netlists describe the RTL being replaced, so they are dropped when the text actually changes.
+    """
+    stem = _stem(mod.__name__.split(".")[-1], spec.name, point_name, seed)
+    ck = Path(str(stem) + ".ckpt")
+    if not ck.exists():
+        raise SystemExit(f"{ck.name} is missing -- train {spec.name}/{point_name} first")
+    model = mod.load(spec, str(ck))
+    model.spec = spec
+    text = model.emit_verilog()
+    sv = Path(str(stem) + ".sv")
+    if sv.exists() and sv.read_text() == text:
+        print(f"[emit ] {sv.name} unchanged, {len(text) / 1e6:.1f} MB", flush=True)
+        return sv
+    tmp = sv.with_suffix(".sv.tmp")
+    tmp.write_text(text)
+    os.replace(tmp, sv)
+    print(f"[emit ] {sv.name}, {len(text) / 1e6:.1f} MB", flush=True)
+    # All measured against RTL that no longer exists -- including a recorded failure, which would
+    # otherwise keep a point marked broken on the strength of a netlist we just replaced.
+    for ext in (".json", ".pre_opt.sv", ".post_opt.sv", ".failed.txt"):
+        stale = Path(str(stem) + ext)
+        if stale.exists():
+            stale.unlink()
+            print(f"[stale] dropped {stale.name}", flush=True)
+    return sv
 
 
 def measure_point(mod: ModuleType, point_name: str, data: Dataset, *, seed: int) -> dict:
@@ -787,8 +845,14 @@ def _jsonable(cfg) -> dict:
 
 
 def trained(stem: Path) -> bool:
-    """Has the training phase left everything the synthesis phase needs for this point?"""
-    return all(Path(str(stem) + e).exists() for e in (".train.json", ".sv", ".ckpt"))
+    """Has the training phase finished this point? The `.sv` is the EMIT phase's product, not
+    training's, so it is deliberately not required here."""
+    return all(Path(str(stem) + e).exists() for e in (".train.json", ".ckpt"))
+
+
+def emitted(stem: Path) -> bool:
+    """Is there RTL for the synthesis phase to read?"""
+    return Path(str(stem) + ".sv").exists()
 
 
 def run_method(name: str, data: Dataset, *, device: str, seed: int,
@@ -796,7 +860,8 @@ def run_method(name: str, data: Dataset, *, device: str, seed: int,
                phase: str = "all") -> None:
     """Run every point of one method's ladder, in order.
 
-    `phase` picks which half runs: "train" (GPU, writes .ckpt/.sv/.train.json), "synth" (no GPU,
+    `phase` picks which one runs: "train" (GPU, writes .ckpt/.train.json), "emit" (no GPU, no
+    yosys, reads the .ckpt and writes the .sv), "synth" (no GPU,
     reads them and writes the measured .json), or "all" for both in one process. A synth pass over
     a point that has not been trained yet just skips it, so the synthesis job can be launched at the
     same time as the training job and simply pick up whatever is ready on each pass.
@@ -810,8 +875,8 @@ def run_method(name: str, data: Dataset, *, device: str, seed: int,
     A summary of what failed is printed at the end and re-raised as a non-zero exit, so the batch
     job is still marked FAILED and the gap is impossible to miss.
     """
-    if phase not in ("all", "train", "synth"):
-        raise SystemExit(f"unknown phase {phase!r} (expected all, train or synth)")
+    if phase not in ("all", "train", "emit", "synth"):
+        raise SystemExit(f"unknown phase {phase!r} (expected all, train, emit or synth)")
     mod = load_method(name)
     failed: list[tuple[str, BaseException]] = []
     for point in mod.points(data.spec):
@@ -823,23 +888,33 @@ def run_method(name: str, data: Dataset, *, device: str, seed: int,
         # what "already done" means depends on the phase: the trainer's product is the .sv+.ckpt,
         # the measurement's product is the .json.
         if phase == "train":
-            # Measured counts as done too: the .json is the deliverable, and the .ckpt/.sv that
-            # produced it are regenerable artifacts that are not kept in git. Without this, a fresh
+            # Measured counts as done too: the .json is the deliverable, and the .ckpt/.sv
+            # behind it are regenerable artifacts that are not kept in git. Without this, a fresh
             # checkout would retrain every point that already has a published result.
             if (trained(stem) or Path(str(stem) + ".json").exists()) and not force:
                 print(f"=== {tag}: already done, skipping (--force to retrain)", flush=True)
+                continue
+        elif phase == "emit":
+            if not trained(stem):
+                print(f"=== {tag}: not trained yet, leaving it for a later pass", flush=True)
+                continue
+            if emitted(stem) and not force:
+                print(f"=== {tag}: already emitted, skipping (--force to re-emit)", flush=True)
                 continue
         else:
             if Path(str(stem) + ".json").exists() and not force:
                 print(f"=== {tag}: measured, skipping (--force to remeasure)", flush=True)
                 continue
-            if phase == "synth" and not trained(stem):
-                print(f"=== {tag}: not trained yet, leaving it for a later pass", flush=True)
+            if phase == "synth" and not (trained(stem) and emitted(stem)):
+                missing = "not trained" if not trained(stem) else "no .sv (run the emit phase)"
+                print(f"=== {tag}: {missing}, leaving it for a later pass", flush=True)
                 continue
 
         def go():
             if phase == "train":
                 train_point(mod, point, data, device=device, seed=seed)
+            elif phase == "emit":
+                emit_point(mod, pt, data.spec, seed=seed)
             elif phase == "synth":
                 measure_point(mod, pt, data, seed=seed)
             else:

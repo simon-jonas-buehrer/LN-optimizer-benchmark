@@ -1,25 +1,32 @@
 """CLI + experiment matrix.
 
-    python run.py train <method> --dataset mnist [--point s] [--device cuda]   # GPU half
+    python run.py train <method> --dataset mnist [--point s] [--device cuda]   # GPU, .ckpt only
+    python run.py emit  <method> --dataset mnist [--point s]                   # .ckpt -> .sv
     python run.py synth <method> --dataset mnist [--point s]                   # yosys half, no GPU
-    python run.py run   <method> --dataset mnist [--point s] [--device cuda]   # both, one process
-    python run.py all [--datasets ...] [--methods ...] [--seeds 0 1] [--phase train|synth|all]
+    python run.py run   <method> --dataset mnist [--point s] [--device cuda]   # all three, one proc
+    python run.py all [--datasets ...] [--methods ...] [--phase train|emit|synth|all]
     python run.py rescore <method> --dataset mnist [--seed 0]      # re-measure stored .sv, no retrain
     python run.py plots                                            # the four figures + leaderboard
 
 The five logic-net optimizers and three quantized references, on MNIST and CIFAR10; results land in
 results/<dataset>/<method>/<point>.s<seed>.{sv,ckpt,train.json,json}.
 
-TRAIN AND SYNTH ARE SEPARABLE ON PURPOSE. They want opposite machines: training needs a GPU and a
-few GB of host RAM, while yosys needs no GPU and up to ~350 GB of host RAM. `train` writes the
-.ckpt and .sv; `synth` reloads the .ckpt, synthesizes the .sv, and cross-checks the netlist against
-that reloaded model before writing the measured .json. Run them as one process with `run` on a
-single machine, or as two differently-shaped batch jobs on a cluster.
+THREE PHASES, ON PURPOSE, BECAUSE THEY WANT THREE DIFFERENT MACHINES.
 
-Resumable in both halves: `train` skips a point that already has its .ckpt/.sv, `synth` skips one
-that already has its .json and passes over one that is not trained yet. Every method uses ONE
-device; for several GPUs, launch several `train --device cuda:N` in parallel (the gitignored
-.local/ has sbatch wrappers for the cluster).
+  train   GPU + a few GB of host RAM     -> .ckpt, .train.json
+  emit    no GPU, seconds, ~1 GB         -> .sv          (a pure function of .ckpt + the emitter)
+  synth   no GPU, minutes to hours, up to ~900 GB of host RAM
+                                         -> .pre_opt.sv, .post_opt.sv, .json
+
+`emit` is separate from `train` because the checkpoint is the only expensive artifact: improving
+the RTL then costs one cheap pass over results/ rather than a retrain, and re-emitting every point
+from ONE emitter is what keeps a ladder's gate counts comparable when training spans a code change.
+`synth` reloads the .ckpt, synthesizes the .sv, and cross-checks the netlist against that reloaded
+model on every test image before writing the measured .json.
+
+Resumable in all three: each skips a point whose own product already exists and passes over one
+whose input is not ready yet. Every method uses ONE device; for several GPUs, launch several
+`train --device cuda:N` in parallel (the gitignored .local/ has sbatch wrappers for the cluster).
 """
 
 from __future__ import annotations
@@ -36,15 +43,16 @@ def main():
     ap = argparse.ArgumentParser(prog="run")
     sub = ap.add_subparsers(dest="cmd", required=True)
 
-    for cmd, helptext in (("run", "train + measure one method on one dataset (one process)"),
-                          ("train", "train one method on one dataset: writes .ckpt/.sv, no yosys"),
-                          ("synth", "synthesize + measure a trained method: no GPU, no training")):
+    for cmd, helptext in (("run", "train + emit + measure one method on one dataset (one process)"),
+                          ("train", "train one method on one dataset: writes .ckpt, no RTL, no yosys"),
+                          ("emit", "write the .sv for a trained method from its .ckpt: no GPU, no yosys"),
+                          ("synth", "synthesize + measure an emitted method: no GPU, no training")):
         r = sub.add_parser(cmd, help=helptext)
         r.add_argument("method", choices=METHODS)
         r.add_argument("--dataset", choices=D.NAMES, required=True)
         r.add_argument("--point", action="append")
         r.add_argument("--seed", type=int, default=0)
-        if cmd != "synth":
+        if cmd in ("run", "train"):
             r.add_argument("--device", default="cpu")
         r.add_argument("--force", action="store_true")
         r.add_argument("--halt-on-error", action="store_true",
@@ -55,8 +63,8 @@ def main():
     a.add_argument("--methods", nargs="+", choices=METHODS, default=METHODS)
     a.add_argument("--seeds", nargs="+", type=int, default=[0])
     a.add_argument("--device", default="cpu")
-    a.add_argument("--phase", choices=["all", "train", "synth"], default="all",
-                   help="run only the GPU half, only the yosys half, or both")
+    a.add_argument("--phase", choices=["all", "train", "emit", "synth"], default="all",
+                   help="run only the GPU phase, only the RTL phase, only the yosys phase, or all")
     a.add_argument("--force", action="store_true")
     a.add_argument("--halt-on-error", action="store_true",
                    help="stop at the first failing point instead of finishing the rest of the matrix")
@@ -101,7 +109,7 @@ def main():
           flush=True)
     if args.cmd == "rescore":
         return harness.rescore_method(args.method, dat, args.seed)
-    phase = {"run": "all", "train": "train", "synth": "synth"}[args.cmd]
+    phase = {"run": "all", "train": "train", "emit": "emit", "synth": "synth"}[args.cmd]
     harness.run_method(args.method, dat, device=getattr(args, "device", "cpu"), seed=args.seed,
                        only=args.point, force=args.force, phase=phase,
                        keep_going=not args.halt_on_error)
