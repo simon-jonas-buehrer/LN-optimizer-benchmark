@@ -26,7 +26,11 @@ model on every test image before writing the measured .json.
 
 Resumable in all three: each skips a point whose own product already exists and passes over one
 whose input is not ready yet. Every method uses ONE device; for several GPUs, launch several
-`train --device cuda:N` in parallel (the gitignored .local/ has sbatch wrappers for the cluster).
+`train --device cuda:N` in parallel -- they write different points and do not interact.
+
+Nothing here is tied to a scheduler or a site: a batch script only has to run these same commands.
+See docs/REPRODUCE.md, and the MNISTBENCH_* environment variables in harness.py for redirecting the
+output tree and pointing at a yosys/liberty of your own.
 """
 
 from __future__ import annotations

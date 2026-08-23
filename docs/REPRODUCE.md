@@ -120,9 +120,29 @@ can never reach the plots; the process still exits non-zero with a list of what 
   ran on (one RTX 3090 for every method except forest, which is CPU). It is a within-method
   scaling quantity; comparing it across methods compares hardware allocations, not optimizers.
 
-## Cluster
+## Running it somewhere else
 
-Cluster-specific `sbatch` wrappers live in the gitignored `.local/` (see `.local/README.md`); they
-just `exec python run.py ...` inside the SLURM job, so cluster and local runs are the same code.
-The GPU sweep is a four-task array holding one GPU each, which schedules where a single four-GPU
-allocation would not.
+Nothing here assumes a particular machine, scheduler or site. The whole sweep is
+
+```bash
+python run.py all --phase train --device cuda:0     # -> .ckpt / .train.json
+python run.py all --phase emit                      # -> .sv
+python run.py all --phase synth                     # -> .pre_opt.sv / .post_opt.sv / .json
+```
+
+and `python run.py all` runs all three in one process on one machine.
+
+The phases are separable precisely so they can go to different hardware, because they want very
+different things: training wants a GPU and a few GB of host RAM, emitting wants neither and takes
+seconds, and yosys wants no GPU at all and — for the widest quantized points — hundreds of GB. Fused
+into one allocation, every GPU worker would also have to reserve the worst synthesis footprint.
+
+Each phase resumes by skipping points whose own artifact already exists and passing over points
+whose input is not ready, so all three are safe to re-run, to interrupt, and to run concurrently
+with each other. That is all a batch script needs: run the same commands under whatever scheduler
+you have. For several GPUs, launch one `--phase train --device cuda:N` per card; each writes to a
+different point and they do not interact.
+
+Set `MNISTBENCH_RESULTS` to redirect the output tree, `MNISTBENCH_YOSYS` to a yosys binary, and
+`MNISTBENCH_LIBERTY` (or `MNISTBENCH_EDA`) to a sky130 liberty for the optional gate-equivalent
+axis. Without a liberty the sweep runs exactly as before and simply reports no GE.

@@ -52,8 +52,8 @@ from data import Dataset, DatasetSpec, to_bits
 
 ROOT = Path(__file__).resolve().parent
 # MNISTBENCH_RESULTS redirects the whole output tree. Assigning `harness.RESULTS` works too, but
-# only inside one process -- the smokes drive `.local/reemit.py` as a SUBPROCESS, and an env var is
-# the only way to point that at a throwaway tree instead of the real results/.
+# only inside one process: a test or a wrapper that drives this package as a SUBPROCESS has the
+# environment as its only way to point that child at a throwaway tree instead of the real results/.
 RESULTS = Path(os.environ.get("MNISTBENCH_RESULTS") or ROOT / "results")
 CHECK_SAMPLES = 512   # historical floor only: run_point now cross-checks the FULL test set
                       # (the circuit predictions it compares against are computed for test_acc anyway)
