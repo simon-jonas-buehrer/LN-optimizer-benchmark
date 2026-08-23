@@ -1,0 +1,28 @@
+{
+  "name": "xl",
+  "method": "dfa",
+  "dataset": "mnist",
+  "seed": 0,
+  "config": {
+    "bits": 1,
+    "width": 4096,
+    "layers": 5,
+    "readout": 1000000,
+    "epochs": 60
+  },
+  "config_effective": {
+    "bits": 1,
+    "width": 4096,
+    "layers": 5,
+    "readout": 1000000,
+    "epochs": 60,
+    "lr": 0.01,
+    "batch": 256,
+    "patience": 12,
+    "micro": 1
+  },
+  "train_s": 264.8,
+  "train_wall_s": 279.9,
+  "train_samples": 2160000,
+  "device": "cuda"
+}

@@ -1,0 +1,27 @@
+{
+  "name": "xs",
+  "method": "w1_58a4",
+  "dataset": "mnist",
+  "seed": 0,
+  "config": {
+    "hidden": [
+      64
+    ]
+  },
+  "config_effective": {
+    "hidden": [
+      64
+    ],
+    "wmode": "ternary",
+    "abits": 4,
+    "epochs": 200,
+    "lr": 0.01,
+    "batch": 128,
+    "patience": 20,
+    "micro": 32
+  },
+  "train_s": 114.3,
+  "train_wall_s": 121.9,
+  "train_samples": 3348000,
+  "device": "cuda"
+}

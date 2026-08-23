@@ -1,0 +1,28 @@
+{
+  "name": "l",
+  "method": "es",
+  "dataset": "mnist",
+  "seed": 0,
+  "config": {
+    "bits": 3,
+    "widths": [
+      160000,
+      80000,
+      40000
+    ],
+    "gens": 3000
+  },
+  "config_effective": {
+    "gens": 3000,
+    "pop": 40,
+    "sigma": 0.1,
+    "lr": 0.1,
+    "batch": 2048,
+    "patience": 20,
+    "eval_every": 10
+  },
+  "train_s": 1053.6,
+  "train_wall_s": 1057.3,
+  "train_samples": 98385920,
+  "device": "cuda"
+}

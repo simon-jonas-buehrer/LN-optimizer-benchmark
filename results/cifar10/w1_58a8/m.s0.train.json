@@ -1,0 +1,29 @@
+{
+  "name": "m",
+  "method": "w1_58a8",
+  "dataset": "cifar10",
+  "seed": 0,
+  "config": {
+    "hidden": [
+      512,
+      512
+    ]
+  },
+  "config_effective": {
+    "hidden": [
+      512,
+      512
+    ],
+    "wmode": "ternary",
+    "abits": 8,
+    "epochs": 200,
+    "lr": 0.01,
+    "batch": 128,
+    "patience": 20,
+    "micro": 32
+  },
+  "train_s": 82.6,
+  "train_wall_s": 84.4,
+  "train_samples": 1980000,
+  "device": "cuda"
+}

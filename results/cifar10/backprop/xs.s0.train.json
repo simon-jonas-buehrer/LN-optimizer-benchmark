@@ -1,0 +1,31 @@
+{
+  "name": "xs",
+  "method": "backprop",
+  "dataset": "cifar10",
+  "seed": 0,
+  "config": {
+    "bits": 1,
+    "widths": [
+      700,
+      300
+    ],
+    "epochs": 200
+  },
+  "config_effective": {
+    "bits": 1,
+    "widths": [
+      700,
+      300
+    ],
+    "epochs": 200,
+    "lr": 0.2,
+    "batch": 128,
+    "cands": 8,
+    "patience": 40,
+    "micro": 8
+  },
+  "train_s": 654.1,
+  "train_wall_s": 662.4,
+  "train_samples": 7380000,
+  "device": "cuda"
+}
