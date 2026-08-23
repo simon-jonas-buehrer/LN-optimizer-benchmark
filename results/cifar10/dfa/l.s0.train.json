@@ -1,0 +1,28 @@
+{
+  "name": "l",
+  "method": "dfa",
+  "dataset": "cifar10",
+  "seed": 0,
+  "config": {
+    "bits": 1,
+    "width": 2048,
+    "layers": 5,
+    "readout": 90000,
+    "epochs": 60
+  },
+  "config_effective": {
+    "bits": 1,
+    "width": 2048,
+    "layers": 5,
+    "readout": 90000,
+    "epochs": 60,
+    "lr": 0.01,
+    "batch": 256,
+    "patience": 12,
+    "micro": 1
+  },
+  "train_s": 33.8,
+  "train_wall_s": 35.8,
+  "train_samples": 2700000,
+  "device": "cuda"
+}

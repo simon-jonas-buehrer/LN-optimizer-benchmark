@@ -1,0 +1,27 @@
+{
+  "name": "xs",
+  "method": "es",
+  "dataset": "mnist",
+  "seed": 0,
+  "config": {
+    "bits": 1,
+    "widths": [
+      700,
+      300
+    ],
+    "gens": 3000
+  },
+  "config_effective": {
+    "gens": 3000,
+    "pop": 40,
+    "sigma": 0.1,
+    "lr": 0.1,
+    "batch": 2048,
+    "patience": 20,
+    "eval_every": 10
+  },
+  "train_s": 91.3,
+  "train_wall_s": 91.9,
+  "train_samples": 245760000,
+  "device": "cuda"
+}

@@ -81,8 +81,28 @@ _MAX_WORDS_GPU = 64         # 4096 images per chunk: a GPU wants fewer, bigger k
 _GPU_MIN_GATES = 200_000    # just above the measured break-even
 
 
+# GENERATION CAP -- the backstop for a point that never converges, not the stopping rule. The rule
+# is early stopping (eval_every * patience = 100,000 generations with no new best); the cap only
+# ever bites on a point that keeps finding marginal improvements forever.
+#
+# It has to fit the 48 h wall clock, because a point has NO mid-point checkpoint: a run cut off by
+# the wall clock restarts at generation 0 in the continuation, so any point that needs more than one
+# window never finishes at all -- it just burns a GPU forever. Measured gen/s on an RTX 2080 Ti node
+# (2026-08-21): CIFAR10 xs 11, s 11, m 9; MNIST xs 33, s 32, m 24. `l` never got to run there, so its
+# ratio to `m` was measured separately on CPU -- every tier here is under `_GPU_MIN_GATES`, so all of
+# them use the numpy cone evaluator, whose cost is nearly flat in net size: 4.03 gen/s at m vs 3.63
+# at l, i.e. l ~= 0.90 * m, putting CIFAR10 l at ~8 gen/s.
+#
+# At the old 2,000,000 that made CIFAR10 m 61.7 h and CIFAR10 l 69.4 h -- both unreachable, and both
+# observed looping. At 1,000,000 the worst point is CIFAR10 l at ~34.7 h, with CIFAR10 m at 30.9 h
+# and every MNIST point under 13 h. Nothing that actually converges is touched: the longest observed
+# convergence is CIFAR10 xs at 210,000 generations (MNIST xs 180,000; both s tiers 120,000), so the
+# cap still sits ~5x above the point where early stopping takes over.
+_GENS = 1_000_000
+
+
 def points(spec: DatasetSpec) -> list[dict]:
-    return [{"name": n, "bits": b, "widths": w, "gens": 2_000_000} for n, (b, w) in _LADDER.items()]
+    return [{"name": n, "bits": b, "widths": w, "gens": _GENS} for n, (b, w) in _LADDER.items()]
 
 
 # ================================================================================================

@@ -1,0 +1,33 @@
+{
+  "name": "xs",
+  "method": "genetic",
+  "dataset": "mnist",
+  "seed": 0,
+  "config": {
+    "bits": 1,
+    "widths": [
+      256,
+      256,
+      160
+    ],
+    "gens": 1000000
+  },
+  "config_effective": {
+    "bits": 1,
+    "widths": [
+      256,
+      256,
+      160
+    ],
+    "gens": 1000000,
+    "k": 8,
+    "mut": 1,
+    "batch": 16384,
+    "eval_every": 5000,
+    "patience": 20
+  },
+  "train_s": 5656.0,
+  "train_wall_s": 5656.9,
+  "train_samples": 23592960000,
+  "device": "cuda"
+}

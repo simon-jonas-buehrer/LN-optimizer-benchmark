@@ -1,0 +1,28 @@
+{
+  "name": "xs",
+  "method": "dfa",
+  "dataset": "mnist",
+  "seed": 0,
+  "config": {
+    "bits": 1,
+    "width": 256,
+    "layers": 5,
+    "readout": 640,
+    "epochs": 60
+  },
+  "config_effective": {
+    "bits": 1,
+    "width": 256,
+    "layers": 5,
+    "readout": 640,
+    "epochs": 60,
+    "lr": 0.01,
+    "batch": 256,
+    "patience": 12,
+    "micro": 1
+  },
+  "train_s": 1.6,
+  "train_wall_s": 4.7,
+  "train_samples": 1404000,
+  "device": "cuda"
+}

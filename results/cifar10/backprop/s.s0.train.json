@@ -1,0 +1,31 @@
+{
+  "name": "s",
+  "method": "backprop",
+  "dataset": "cifar10",
+  "seed": 0,
+  "config": {
+    "bits": 1,
+    "widths": [
+      4000,
+      2000
+    ],
+    "epochs": 200
+  },
+  "config_effective": {
+    "bits": 1,
+    "widths": [
+      4000,
+      2000
+    ],
+    "epochs": 200,
+    "lr": 0.2,
+    "batch": 128,
+    "cands": 8,
+    "patience": 40,
+    "micro": 8
+  },
+  "train_s": 815.6,
+  "train_wall_s": 817.3,
+  "train_samples": 9000000,
+  "device": "cuda"
+}

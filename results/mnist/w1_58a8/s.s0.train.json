@@ -1,0 +1,27 @@
+{
+  "name": "s",
+  "method": "w1_58a8",
+  "dataset": "mnist",
+  "seed": 0,
+  "config": {
+    "hidden": [
+      256
+    ]
+  },
+  "config_effective": {
+    "hidden": [
+      256
+    ],
+    "wmode": "ternary",
+    "abits": 8,
+    "epochs": 200,
+    "lr": 0.01,
+    "batch": 128,
+    "patience": 20,
+    "micro": 32
+  },
+  "train_s": 133.1,
+  "train_wall_s": 134.2,
+  "train_samples": 4698000,
+  "device": "cuda"
+}

@@ -90,13 +90,26 @@ def _ste_round(x):
 
 
 def _quant_w(Wf, wmode):
-    """Fake-quant weights with STE. ternary -> {-1,0,1} (TWN); int4 -> {-8..7}."""
+    """Fake-quant weights with STE. ternary -> {-1,0,1} (TWN); int4 -> {-8..7}.
+
+    Both branches return the INTEGER weight the exporter writes. The magnitude a real quantizer
+    would carry in a separate scale is absorbed by the layer's learned requant (`log_s`) on the
+    hidden layers, and on the final layer a single scalar cannot move the argmax at all -- which is
+    exactly why the int4 step below is per-TENSOR. A per-column step would be a per-logit gain that
+    `hw.QLayer` (one scalar mul/shift per layer) cannot represent, so the emitted circuit would stop
+    matching `predict()` on the final layer.
+
+    Without a step, int4 is dead on arrival: init is randn/sqrt(n_in), i.e. |W| ~ 0.02 (CIFAR10) to
+    0.04 (MNIST), so `round()` sends every weight to 0 and keeps it there -- measured as a constant
+    0-gate circuit with val loss pinned at ln 10 = 2.3026 on BOTH datasets. sigma ~ |W|.mean()/0.798
+    for a Gaussian, and clipping at 3 sigma puts the step at 3*sigma/7.
+    """
     if wmode == "ternary":
         delta = 0.7 * Wf.abs().mean(0, keepdim=True)
         hard = torch.where(Wf > delta, 1.0, torch.where(Wf < -delta, -1.0, 0.0))
         return Wf + (hard - Wf).detach()
-    hard = torch.clamp(_ste_round(Wf), -8, 7)  # int4
-    return hard
+    step = (Wf.detach().abs().mean() * (3.0 / 0.7979 / 7.0)).clamp_min(1e-12)  # int4
+    return torch.clamp(_ste_round(Wf / step), -8, 7)
 
 
 class _Layer(torch.nn.Module):
