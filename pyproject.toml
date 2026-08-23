@@ -13,3 +13,48 @@ dependencies = ["numpy>=1.24", "torch>=2.2", "matplotlib>=3.7"]
 #   conda create -n eda -c conda-forge -c litex-hub yosys open_pdks.sky130a
 # See docs/REPRODUCE.md.
 
+# ---------------------------------------------------------------------------------------------
+# uv
+#
+#   uv sync          -> .venv, exactly the environment of record (Python 3.11, torch 2.6.0+cu124)
+#   uv run run.py …  -> any command in the repo, syncing first if the lock moved
+#
+# `dependencies` above stays loose on purpose: `pip install -e .` must keep working on CPU and on
+# newer drivers. uv is the *reproduction* path instead, so it is pinned hard here: the constraints
+# below hold the resolve to requirements-lock.txt, and uv.lock records the result. torch comes from
+# the cu124 wheel index rather than PyPI because the RTX 3090 nodes run driver 535 / CUDA 12.2 --
+# a default PyPI torch is built for a newer CUDA and dies with "driver too old".
+# ---------------------------------------------------------------------------------------------
+
+[tool.uv]
+required-version = ">=0.5"
+
+# Flat modules (run.py, harness.py, methods/), nothing to build or install -- uv only manages deps.
+package = false
+
+# Lock for the machines this actually runs on. Without this, uv resolves for every platform and the
+# cu124 index (Linux x86_64 wheels only) has nothing to offer macOS or Windows. `requires-python`
+# above stays >=3.10 for the pip path, which is free to resolve an older matplotlib there; the lock
+# is 3.11-only because the environment of record is 3.11.15.
+environments = [
+  "sys_platform == 'linux' and platform_machine == 'x86_64' and python_full_version >= '3.11'",
+]
+
+# The environment of record, version for version. Constraints bound the resolve without adding
+# dependencies, so they pin uv.lock while leaving `pip install -e .` free.
+constraint-dependencies = [
+  "torch==2.6.0",
+  "triton==3.2.0",
+  "numpy==2.4.6",
+  "matplotlib==3.11.1",
+  "filelock==3.32.3",
+]
+
+[tool.uv.sources]
+torch = { index = "pytorch-cu124" }
+
+[[tool.uv.index]]
+name = "pytorch-cu124"
+url = "https://download.pytorch.org/whl/cu124"
+# explicit: only what tool.uv.sources sends here is looked up here; everything else stays on PyPI.
+explicit = true

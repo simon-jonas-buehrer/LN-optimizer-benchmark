@@ -3,17 +3,33 @@
 The repo runs anywhere with Python + yosys. Training uses a GPU; **measuring** (emit → yosys/ABC →
 NAND-netlist simulation) is integer-exact numpy and does not depend on the torch build at all.
 
-## 1. Python
+## 1. Python — uv
 
 ```bash
-pip install -e .                  # numpy + torch + matplotlib, loose pins
+uv sync            # creates .venv from uv.lock: Python 3.11, torch 2.6.0+cu124, numpy 2.4.6
+uv run run.py …    # every command below; re-checks the environment first, so `uv sync` is optional
 ```
 
-### The environment of record
+`uv.lock` **is** the environment of record — the exact set of packages every number in `results/`
+came from, resolved for Linux x86_64 / Python 3.11. Nothing to activate: `uv run` runs against it.
 
-`pyproject.toml` keeps loose pins so the repo also runs on newer drivers and on CPU. A different
-torch build trains a numerically different net, so to reproduce the *published* numbers use the
-exact environment every result in `results/` came from — [`requirements-lock.txt`](../requirements-lock.txt):
+Two things in [`pyproject.toml`](../pyproject.toml) make the lock reproduce rather than drift:
+
+* **torch comes from the cu124 wheel index**, not PyPI (`[tool.uv.sources]` + an explicit
+  `[[tool.uv.index]]`). The GPUs here are RTX 3090s on driver 535 / CUDA 12.2; a default PyPI torch
+  is built against a newer CUDA and fails to load with *driver too old*.
+* **`constraint-dependencies` pins the resolve** to torch 2.6.0 / numpy 2.4.6 / matplotlib 3.11.1,
+  while `dependencies` stays loose (`torch>=2.2`) so the pip route below still works on CPU and on
+  newer drivers.
+
+Python 3.11.15, torch 2.6.0+cu124, numpy 2.4.6, on 4× NVIDIA RTX 3090 (24 GB), driver 535 / CUDA
+12.2, Debian 12. yosys 0.68+ (conda-forge, git sha1 `36d0660ff`) with its bundled ABC.
+
+### Without uv
+
+`pip install -e .` gets the loose pins — portable, but a different torch build trains a numerically
+different net, so it does not reproduce the published numbers. The same environment by hand, from
+[`requirements-lock.txt`](../requirements-lock.txt):
 
 ```bash
 python3.11 -m venv .venv && . .venv/bin/activate
@@ -21,8 +37,7 @@ pip install --index-url https://download.pytorch.org/whl/cu124 torch==2.6.0
 pip install -r requirements-lock.txt
 ```
 
-Python 3.11.15, torch 2.6.0+cu124, numpy 2.4.6, on 4× NVIDIA RTX 3090 (24 GB), driver 535 / CUDA
-12.2, Debian 12. yosys 0.68+ (conda-forge, git sha1 `36d0660ff`) with its bundled ABC.
+That file and `uv.lock` are the same environment, package for package.
 
 ## 2. yosys + ABC (+ optional sky130)
 
@@ -45,19 +60,23 @@ wall-clock bottleneck at the large tiers, so the recommended order is: sweep wit
 `MNISTBENCH_YOSYS` only, then add GE afterwards from the stored `.sv`, without retraining:
 
 ```bash
-MNISTBENCH_EDA=/path/to/eda python run.py rescore backprop --dataset mnist
+MNISTBENCH_EDA=/path/to/eda uv run run.py rescore backprop --dataset mnist
 ```
 
 ## 3. Run
 
 ```bash
-python run.py all --device cuda           # the whole matrix, resumable
+uv run run.py all --device cuda           # the whole matrix, resumable
 # Every method trains in ONE process on ONE device, so several GPUs means several processes --
 # one method x dataset cell each:
-python run.py run backprop --dataset mnist   --device cuda:0 &
-python run.py run forest   --dataset cifar10 --device cpu    &
-python run.py plots                        # the four figures + results/leaderboard.md
+uv run run.py run backprop --dataset mnist   --device cuda:0 &
+uv run run.py run forest   --dataset cifar10 --device cpu    &
+uv run run.py plots                        # the four figures + results/leaderboard.md
 ```
+
+`uv run` syncs the environment before each command, which is a few milliseconds when nothing
+changed. To skip that check — inside a batch job, or when several processes share one `.venv` and
+must not race to rewrite it — use `uv run --no-sync --frozen run.py …` and sync once up front.
 
 Results land in `results/<dataset>/<method>/<point>.s<seed>.{sv,ckpt,json}`. Only the `.json` files
 and the figures are committed; the `.sv` and `.ckpt` are regenerable and gitignored. A point whose
@@ -125,12 +144,12 @@ can never reach the plots; the process still exits non-zero with a list of what 
 Nothing here assumes a particular machine, scheduler or site. The whole sweep is
 
 ```bash
-python run.py all --phase train --device cuda:0     # -> .ckpt / .train.json
-python run.py all --phase emit                      # -> .sv
-python run.py all --phase synth                     # -> .pre_opt.sv / .post_opt.sv / .json
+uv run run.py all --phase train --device cuda:0     # -> .ckpt / .train.json
+uv run run.py all --phase emit                      # -> .sv
+uv run run.py all --phase synth                     # -> .pre_opt.sv / .post_opt.sv / .json
 ```
 
-and `python run.py all` runs all three in one process on one machine.
+and `uv run run.py all` runs all three in one process on one machine.
 
 The phases are separable precisely so they can go to different hardware, because they want very
 different things: training wants a GPU and a few GB of host RAM, emitting wants neither and takes

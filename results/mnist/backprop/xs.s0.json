@@ -1,0 +1,48 @@
+{
+  "name": "xs",
+  "method": "backprop",
+  "dataset": "mnist",
+  "seed": 0,
+  "config": {
+    "bits": 1,
+    "widths": [
+      700,
+      300
+    ],
+    "epochs": 200
+  },
+  "config_effective": {
+    "bits": 1,
+    "widths": [
+      700,
+      300
+    ],
+    "epochs": 200,
+    "lr": 0.2,
+    "batch": 128,
+    "cands": 8,
+    "patience": 40,
+    "micro": 8
+  },
+  "train_s": 801.5,
+  "train_wall_s": 809.6,
+  "train_samples": 9180000,
+  "device": "cuda",
+  "gates": 4276,
+  "nand": 2623,
+  "inv": 1653,
+  "depth": 166,
+  "test_acc": 82.55,
+  "ge": 3416.7,
+  "area_um2": 12824.8,
+  "cells": 2329,
+  "ge_pre_abc": 6004.7,
+  "ge_post_abc": 3416.7,
+  "cells_pre_abc": 3995,
+  "cells_post_abc": 2329,
+  "ge_abc_ratio": 1.757,
+  "val_acc": 80.6,
+  "test_ce": 0.5428,
+  "test_ppl": 1.7208,
+  "ce_temp": 0.0715
+}

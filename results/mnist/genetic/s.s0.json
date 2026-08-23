@@ -1,0 +1,50 @@
+{
+  "name": "s",
+  "method": "genetic",
+  "dataset": "mnist",
+  "seed": 0,
+  "config": {
+    "bits": 1,
+    "widths": [
+      1024,
+      1024,
+      320
+    ],
+    "gens": 1000000
+  },
+  "config_effective": {
+    "bits": 1,
+    "widths": [
+      1024,
+      1024,
+      320
+    ],
+    "gens": 1000000,
+    "k": 8,
+    "mut": 1,
+    "batch": 16384,
+    "eval_every": 5000,
+    "patience": 20
+  },
+  "train_s": 4431.1,
+  "train_wall_s": 4431.6,
+  "train_samples": 15728640000,
+  "device": "cuda",
+  "gates": 4601,
+  "nand": 3279,
+  "inv": 1322,
+  "depth": 172,
+  "test_acc": 79.21,
+  "ge": 4146.3,
+  "area_um2": 15563.7,
+  "cells": 2835,
+  "ge_pre_abc": 7956.0,
+  "ge_post_abc": 4146.3,
+  "cells_pre_abc": 5259,
+  "cells_post_abc": 2835,
+  "ge_abc_ratio": 1.919,
+  "val_acc": 77.18,
+  "test_ce": 0.6406,
+  "test_ppl": 1.8976,
+  "ce_temp": 0.0523
+}

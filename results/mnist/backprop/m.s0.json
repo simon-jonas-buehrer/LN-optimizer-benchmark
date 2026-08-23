@@ -1,0 +1,48 @@
+{
+  "name": "m",
+  "method": "backprop",
+  "dataset": "mnist",
+  "seed": 0,
+  "config": {
+    "bits": 3,
+    "widths": [
+      26000,
+      13000
+    ],
+    "epochs": 200
+  },
+  "config_effective": {
+    "bits": 3,
+    "widths": [
+      26000,
+      13000
+    ],
+    "epochs": 200,
+    "lr": 0.2,
+    "batch": 128,
+    "cands": 8,
+    "patience": 40,
+    "micro": 8
+  },
+  "train_s": 948.5,
+  "train_wall_s": 960.8,
+  "train_samples": 10800000,
+  "device": "cuda",
+  "gates": 198488,
+  "nand": 133952,
+  "inv": 64536,
+  "depth": 310,
+  "test_acc": 96.87,
+  "ge": 160858.7,
+  "area_um2": 603799.1,
+  "cells": 104593,
+  "ge_pre_abc": 176875.0,
+  "ge_post_abc": 160858.7,
+  "cells_pre_abc": 105501,
+  "cells_post_abc": 104593,
+  "ge_abc_ratio": 1.1,
+  "val_acc": 96.42,
+  "test_ce": 0.1014,
+  "test_ppl": 1.1067,
+  "ce_temp": 0.0193
+}

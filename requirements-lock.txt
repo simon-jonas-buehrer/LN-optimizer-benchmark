@@ -1,14 +1,19 @@
 # The environment of record: exactly what produced every number in results/.
 # Python 3.11.15, CUDA driver 535 / CUDA 12.2 (4x NVIDIA RTX 3090, 24 GB), Debian 12.
 #
+# THE PIP ROUTE. `uv sync` installs this same environment from uv.lock and is what the repo and the
+# cluster jobs actually use -- see docs/REPRODUCE.md. This file is the equivalent by hand, for a
+# machine without uv:
+#
 #   python3.11 -m venv .venv && . .venv/bin/activate
 #   pip install --index-url https://download.pytorch.org/whl/cu124 torch==2.6.0
 #   pip install -r requirements-lock.txt
 #
 # pyproject.toml deliberately keeps a loose `torch>=2.2` so the repo also runs on newer drivers and
-# on CPU -- but a different torch trains a numerically different net, so use this file to reproduce
-# the published numbers rather than a fresh resolve. The MEASUREMENT side (emit -> yosys/ABC ->
-# NAND simulation) is integer-exact and does not depend on the torch build at all.
+# on CPU -- its `[tool.uv] constraint-dependencies` is what holds uv.lock to the versions below, so
+# the two locks cannot drift apart. Do not reproduce the published numbers from a fresh loose
+# resolve: a different torch trains a numerically different net. The MEASUREMENT side (emit ->
+# yosys/ABC -> NAND simulation) is integer-exact and does not depend on the torch build at all.
 #
 # Circuit measurement (not pip-installable), see docs/REPRODUCE.md:
 #   yosys 0.68+ (git sha1 36d0660ff), conda-forge; ABC is the one bundled with it.
@@ -38,3 +43,18 @@ setuptools==84.0.0
 six==1.17.0
 sympy==1.13.1
 typing_extensions==4.16.0
+
+# CUDA runtime wheels, pulled in by torch 2.6.0+cu124 (uv.lock lists these too)
+nvidia-cublas-cu12==12.4.5.8
+nvidia-cuda-cupti-cu12==12.4.127
+nvidia-cuda-nvrtc-cu12==12.4.127
+nvidia-cuda-runtime-cu12==12.4.127
+nvidia-cudnn-cu12==9.1.0.70
+nvidia-cufft-cu12==11.2.1.3
+nvidia-curand-cu12==10.3.5.147
+nvidia-cusolver-cu12==11.6.1.9
+nvidia-cusparse-cu12==12.3.1.170
+nvidia-cusparselt-cu12==0.6.2
+nvidia-nccl-cu12==2.21.5
+nvidia-nvjitlink-cu12==12.4.127
+nvidia-nvtx-cu12==12.4.127

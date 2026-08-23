@@ -34,13 +34,15 @@ on validation loss**.
 ## Reproduce
 
 ```bash
-pip install -e .                       # numpy + torch + matplotlib
-# or, for the exact environment the published numbers came from:
-#   pip install --index-url https://download.pytorch.org/whl/cu124 torch==2.6.0
-#   pip install -r requirements-lock.txt
-python run.py all --device cuda        # every method x dataset (resumable; skips finished points)
-python run.py plots                    # the four figures + results/leaderboard.md
+uv sync                                # .venv == uv.lock: Python 3.11, torch 2.6.0+cu124, numpy 2.4.6
+uv run run.py all --device cuda        # every method x dataset (resumable; skips finished points)
+uv run run.py plots                    # the four figures + results/leaderboard.md
 ```
+
+`uv sync` installs the exact environment every published number came from — `uv.lock` is that
+environment, and `uv run` re-checks it before each command. Without uv, `pip install -e .` gets a
+loose, portable resolve (CPU or a newer CUDA) that trains numerically different nets; see
+[docs/REPRODUCE.md](docs/REPRODUCE.md) for the pip route to the pinned one.
 
 Measuring circuits needs `yosys`+`ABC` (and, only for the optional sky130 GE metric, the sky130
 liberty). See [docs/REPRODUCE.md](docs/REPRODUCE.md). The measurement protocol is
