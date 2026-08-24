@@ -1,0 +1,25 @@
+{
+  "name": "l",
+  "method": "forest",
+  "dataset": "cifar10",
+  "seed": 0,
+  "config": {
+    "bits": 7,
+    "leaves": 512,
+    "wbits": 2,
+    "trees": 120
+  },
+  "config_effective": {
+    "trees": 120,
+    "leaves": 512,
+    "wbits": 2,
+    "bits": 7,
+    "min_leaf": 5,
+    "lr": 0.3,
+    "patience": 30
+  },
+  "train_s": 654.7,
+  "train_wall_s": 656.8,
+  "train_samples": 4815000,
+  "device": "cpu"
+}

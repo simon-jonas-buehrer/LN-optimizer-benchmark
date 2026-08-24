@@ -1,0 +1,25 @@
+{
+  "name": "l",
+  "method": "forest",
+  "dataset": "mnist",
+  "seed": 0,
+  "config": {
+    "bits": 7,
+    "leaves": 512,
+    "wbits": 2,
+    "trees": 120
+  },
+  "config_effective": {
+    "trees": 120,
+    "leaves": 512,
+    "wbits": 2,
+    "bits": 7,
+    "min_leaf": 5,
+    "lr": 0.3,
+    "patience": 30
+  },
+  "train_s": 126.9,
+  "train_wall_s": 127.6,
+  "train_samples": 1026000,
+  "device": "cpu"
+}

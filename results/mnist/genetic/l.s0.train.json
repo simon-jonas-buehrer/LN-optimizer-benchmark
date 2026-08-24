@@ -1,0 +1,37 @@
+{
+  "name": "l",
+  "method": "genetic",
+  "dataset": "mnist",
+  "seed": 0,
+  "config": {
+    "bits": 3,
+    "widths": [
+      4096,
+      4096,
+      4096,
+      4096,
+      1280
+    ],
+    "gens": 1000000
+  },
+  "config_effective": {
+    "bits": 3,
+    "widths": [
+      4096,
+      4096,
+      4096,
+      4096,
+      1280
+    ],
+    "gens": 1000000,
+    "k": 8,
+    "mut": 1,
+    "batch": 16384,
+    "eval_every": 5000,
+    "patience": 20
+  },
+  "train_s": 7687.1,
+  "train_wall_s": 7687.8,
+  "train_samples": 14417920000,
+  "device": "cuda"
+}

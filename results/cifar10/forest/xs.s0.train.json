@@ -1,0 +1,25 @@
+{
+  "name": "xs",
+  "method": "forest",
+  "dataset": "cifar10",
+  "seed": 0,
+  "config": {
+    "bits": 7,
+    "leaves": 16,
+    "wbits": 2,
+    "trees": 9
+  },
+  "config_effective": {
+    "trees": 9,
+    "leaves": 16,
+    "wbits": 2,
+    "bits": 7,
+    "min_leaf": 5,
+    "lr": 0.3,
+    "patience": 30
+  },
+  "train_s": 29.3,
+  "train_wall_s": 30.7,
+  "train_samples": 405000,
+  "device": "cpu"
+}

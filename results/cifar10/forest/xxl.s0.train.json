@@ -1,0 +1,25 @@
+{
+  "name": "xxl",
+  "method": "forest",
+  "dataset": "cifar10",
+  "seed": 0,
+  "config": {
+    "bits": 7,
+    "leaves": 4096,
+    "wbits": 2,
+    "trees": 1200
+  },
+  "config_effective": {
+    "trees": 1200,
+    "leaves": 4096,
+    "wbits": 2,
+    "bits": 7,
+    "min_leaf": 5,
+    "lr": 0.3,
+    "patience": 30
+  },
+  "train_s": 4655.6,
+  "train_wall_s": 4661.1,
+  "train_samples": 18495000,
+  "device": "cpu"
+}

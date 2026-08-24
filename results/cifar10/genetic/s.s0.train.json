@@ -1,0 +1,33 @@
+{
+  "name": "s",
+  "method": "genetic",
+  "dataset": "cifar10",
+  "seed": 0,
+  "config": {
+    "bits": 1,
+    "widths": [
+      1024,
+      1024,
+      320
+    ],
+    "gens": 1000000
+  },
+  "config_effective": {
+    "bits": 1,
+    "widths": [
+      1024,
+      1024,
+      320
+    ],
+    "gens": 1000000,
+    "k": 8,
+    "mut": 1,
+    "batch": 16384,
+    "eval_every": 5000,
+    "patience": 20
+  },
+  "train_s": 12314.3,
+  "train_wall_s": 12314.7,
+  "train_samples": 15728640000,
+  "device": "cuda"
+}

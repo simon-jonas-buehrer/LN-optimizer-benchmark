@@ -1,0 +1,45 @@
+{
+  "name": "xl",
+  "method": "es",
+  "dataset": "mnist",
+  "seed": 0,
+  "config": {
+    "bits": 7,
+    "widths": [
+      1000000,
+      500000,
+      250000
+    ],
+    "gens": 3000
+  },
+  "config_effective": {
+    "gens": 3000,
+    "pop": 40,
+    "sigma": 0.1,
+    "lr": 0.1,
+    "batch": 2048,
+    "patience": 20,
+    "eval_every": 10
+  },
+  "train_s": 4675.9,
+  "train_wall_s": 4691.8,
+  "train_samples": 72990720,
+  "device": "cuda",
+  "gates": 2798849,
+  "nand": 1886972,
+  "inv": 911877,
+  "depth": 386,
+  "test_acc": 49.11,
+  "ge": 2204815.3,
+  "area_um2": 8275994.8,
+  "cells": 1444437,
+  "ge_pre_abc": 2353004.3,
+  "ge_post_abc": 2204815.3,
+  "cells_pre_abc": 1387546,
+  "cells_post_abc": 1444437,
+  "ge_abc_ratio": 1.067,
+  "val_acc": 47.82,
+  "test_ce": 1.5251,
+  "test_ppl": 4.5957,
+  "ce_temp": 0.0013
+}

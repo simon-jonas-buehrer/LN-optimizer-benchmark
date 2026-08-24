@@ -1,0 +1,25 @@
+{
+  "name": "xl",
+  "method": "forest",
+  "dataset": "mnist",
+  "seed": 0,
+  "config": {
+    "bits": 7,
+    "leaves": 2048,
+    "wbits": 2,
+    "trees": 300
+  },
+  "config_effective": {
+    "trees": 300,
+    "leaves": 2048,
+    "wbits": 2,
+    "bits": 7,
+    "min_leaf": 5,
+    "lr": 0.3,
+    "patience": 30
+  },
+  "train_s": 201.2,
+  "train_wall_s": 202.0,
+  "train_samples": 1242000,
+  "device": "cpu"
+}

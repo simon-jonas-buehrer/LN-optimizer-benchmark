@@ -1,0 +1,25 @@
+{
+  "name": "xs",
+  "method": "forest",
+  "dataset": "mnist",
+  "seed": 0,
+  "config": {
+    "bits": 7,
+    "leaves": 16,
+    "wbits": 2,
+    "trees": 9
+  },
+  "config_effective": {
+    "trees": 9,
+    "leaves": 16,
+    "wbits": 2,
+    "bits": 7,
+    "min_leaf": 5,
+    "lr": 0.3,
+    "patience": 30
+  },
+  "train_s": 9.7,
+  "train_wall_s": 10.2,
+  "train_samples": 486000,
+  "device": "cpu"
+}
